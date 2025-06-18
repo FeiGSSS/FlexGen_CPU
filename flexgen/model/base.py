@@ -65,8 +65,8 @@ class BaseModel:
             weight = home.allocate(shape, dtype, pin_memory=pin_memory)
 
             if DUMMY_WEIGHT not in filename:
-                raise NotImplementedError()
-                # weight.load_from_np_file(filename)
+                # raise NotImplementedError()
+                weight.load_from_np_file(filename)
             else:
                 weight.load_from_np(np.ones(shape, dtype))
             ret.append(weight)

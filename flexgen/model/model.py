@@ -141,11 +141,11 @@ class OutputEmbed(BaseModel):
         
         weight_specs = [
             # w_ln
-            ((hidden_size,), dtype, path + "decoder.layer_norm.weight"),
+            ((hidden_size,), dtype, os.path.join(path, "decoder.layer_norm.weight")),
             # b_ln
-            ((hidden_size,), dtype, path + "decoder.layer_norm.bias"),
+            ((hidden_size,), dtype, os.path.join(path, "decoder.layer_norm.bias")),
             # w_token
-            ((vocab_size, hidden_size), dtype, path + "decoder.embed_tokens.weight"),
+            ((vocab_size, hidden_size), dtype, os.path.join(path, "decoder.embed_tokens.weight")),
         ]
         
         weights = self.init_weight_list(weight_specs, self.policy, self.env)
