@@ -157,7 +157,7 @@ class TorchDevice:
                  pin_memory: bool = None,
                  name: str = None) -> TorchTensor:
         if self.DeviceType == DeviceType.CPU:
-            pin_memory = True if pin_memory is None else pin_memory
+            pin_memory = False
         else:
             raise NotImplementedError(f"DeviceType {self.DeviceType} not implemented")
         

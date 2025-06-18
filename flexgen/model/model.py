@@ -53,9 +53,9 @@ class InputEmbed(BaseModel):
         
         weight_specs = [
             # w_token
-            ((vocab_size, hidden_size), dtype, path + "decoder.embed_tokens.weight"),
+            ((vocab_size, hidden_size), dtype, os.path.join(path, "decoder.embed_tokens.weight")),
             # w_pos
-            ((seq_len + 2, hidden_size), dtype, path + "decoder.embed_positions.weight"),
+            ((seq_len + 2, hidden_size), dtype, os.path.join(path, "decoder.embed_positions.weight")),
         ]
         
         weights = self.init_weight_list(weight_specs, self.policy, self.env)
