@@ -57,12 +57,7 @@ class BaseModel:
             home = get_choice(mid_percent * 100, dev_percents, dev_choices)
             shape, dtype, filename = weight_specs[i]
 
-            if len(shape) < 2:
-                pin_memory = True
-            else:
-                pin_memory = policy.pin_weight
-
-            weight = home.allocate(shape, dtype, pin_memory=pin_memory)
+            weight = home.allocate(shape, dtype)
 
             if DUMMY_WEIGHT not in filename:
                 # raise NotImplementedError()

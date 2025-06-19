@@ -154,15 +154,9 @@ class TorchDevice:
     def allocate(self,
                  shape: Tuple,
                  dtype: np.dtype,
-                 pin_memory: bool = None,
-                 name: str = None) -> TorchTensor:
-        if self.DeviceType == DeviceType.CPU:
-            pin_memory = False
-        else:
-            raise NotImplementedError(f"DeviceType {self.DeviceType} not implemented")
-        
+                 name: str = None) -> TorchTensor:        
         dtype = np_dtype_to_torch_dtype[dtype]
-        data = torch.empty(shape, dtype=dtype, device=self.dev, pin_memory=pin_memory)
+        data = torch.empty(shape, dtype=dtype, device=self.dev)
         return TorchTensor.create_from_torch(data, self, name)
     
     
@@ -183,8 +177,8 @@ class TorchDevice:
         # so we only need one workspace instead of two.
         for i in range(1 if policy.sep_layer else 2):
             shape = (max_seq_len, batch_size * n_head, head_dim)
-            k_cache = self.allocate(shape, np.float32, pin_memory=False)
-            v_cache = self.allocate(shape, np.float32, pin_memory=False)
+            k_cache = self.allocate(shape, np.float32)
+            v_cache = self.allocate(shape, np.float32)
             self.attention_compute_workspace.append((k_cache, v_cache))
 
     def next_attention_compute_workspace(self) -> Tuple[TorchTensor, TorchTensor]:
@@ -222,9 +216,9 @@ class TorchDevice:
         batch_size = policy.batch_size
         
         shape = (prompt_len + gen_len - 1, batch_size * n_head, hidden_size // n_head)
-        k_cache = self.allocate(shape, np.float16, pin_memory=False)
-        v_cache = self.allocate(shape, np.float16, pin_memory=False)
-        
+        k_cache = self.allocate(shape, np.float16)
+        v_cache = self.allocate(shape, np.float16)
+
         return k_cache, v_cache
     
     def delete(self, tensor: TorchTensor) -> None:
@@ -275,7 +269,6 @@ class TorchDisk:
     def allocate(self,
                  shape: Tuple,
                  dtype: np.dtype,
-                 pin_memory: bool = None,
                  name: str = None) -> TorchTensor:
         """
         Allocate a tensor on disk.
@@ -333,7 +326,6 @@ class TorchMixedDevice:
                  shape: Tuple,
                  dtype: np.dtype,
                  seg_lengths: List,
-                 pin_memory: bool = None,
                  name: str = None) -> TorchTensor:
         
         assert sum(seg_lengths) == shape[SEG_DIM]
@@ -349,8 +341,7 @@ class TorchMixedDevice:
                 tensors.append(None)
             else:
                 seg_shape = shape[:SEG_DIM] + (seg_len,) + shape[SEG_DIM+1:]
-                tensors.append(devices[i].allocate(seg_shape, dtype,
-                    pin_memory=pin_memory))
+                tensors.append(devices[i].allocate(seg_shape, dtype))
         return TorchTensor(shape, np_dtype_to_torch_dtype[dtype],
                            (tensors, seg_points), self, name=name)
 
@@ -379,9 +370,8 @@ class TorchMixedDevice:
             len_disk = shape[SEG_DIM] - len_cpu
         lens = [len_cpu, len_disk]
 
-        pin_memory = False
-        k_cache = self.allocate(shape, np.float16, seg_lengths=lens, pin_memory=pin_memory)
-        v_cache = self.allocate(shape, np.float16, seg_lengths=lens, pin_memory=pin_memory)
+        k_cache = self.allocate(shape, np.float16, seg_lengths=lens)
+        v_cache = self.allocate(shape, np.float16, seg_lengths=lens)
         return k_cache, v_cache
 
 

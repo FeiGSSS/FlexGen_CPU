@@ -60,7 +60,6 @@ def run_flexllmgen(args):
                     args.percent[2],
                     args.overlap,
                     args.sep_layer,
-                    args.pin_weight,
                     args.attn_sparsity)
 
     opt_config = get_opt_config(args.model)
@@ -145,8 +144,6 @@ def add_parser_arguments(parser):
          "the percentage of attention cache on CPU, "
          "the percentage of activations on CPU")
     parser.add_argument("--sep_layer", type=str2bool, nargs='?',
-        const=True, default=True)
-    parser.add_argument("--pin_weight", type=str2bool, nargs="?",
         const=True, default=True)
     parser.add_argument("--attn_sparsity", type=float, default=1.0)
 

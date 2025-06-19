@@ -83,9 +83,6 @@ class Policy:
     # Whether to separate attention and mlp as two layers
     sep_layer: bool
 
-    # Whether to use pinned memory for weights on CPU
-    pin_weight: bool
-
     # Sparsity of attention weights
     attn_sparsity: float
 
