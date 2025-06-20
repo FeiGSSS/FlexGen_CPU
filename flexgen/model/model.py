@@ -42,7 +42,7 @@ class InputEmbed(BaseModel):
         self.env = env
         self.policy = policy
         self.compute = env.cpu
-        self.weight_load_dst = self.compute
+        self.weight_load_dst = self.compute.compressed_device if policy.comp_weight else self.compute
         
     def init_weight(self, weight_home: ValueHolder, path:str)-> None:
         """Load weights to DISK/CPU/(GPU) according to the policy."""
@@ -100,6 +100,11 @@ class InputEmbed(BaseModel):
         
         pad_token_id = self.config.pad_token_id
         
+        # decompress weights
+        if w_token.device.DeviceType == DeviceType.COMPRESSED:
+            w_token = w_token.device.decompress(w_token)
+            w_pos = w_pos.device.decompress(w_pos)
+        
         # token embedding
         token_embed = F.embedding(token_ids, w_token.data, pad_token_id)
         
@@ -131,7 +136,7 @@ class OutputEmbed(BaseModel):
         self.env = env
         self.policy = policy
         self.compute = env.cpu
-        self.weight_load_dst = self.compute
+        self.weight_load_dst = self.compute.compressed_device if policy.comp_weight else self.compute
         
     def init_weight(self, weight_home: ValueHolder, path:str)-> None:
         """Load weights to DISK/CPU/(GPU) according to the policy."""
@@ -159,10 +164,10 @@ class OutputEmbed(BaseModel):
         """Load weights from DISK/CPU/(GPU) to CPU/(GPU) according to the policy."""
         if batch_idx != 0: return
         w_ln, b_ln, w_token = weight_home.val
-        dst = self.weight_load_dst
-        weight_read_buf.store((w_ln.smart_copy(dst),
-                               b_ln.smart_copy(dst),
-                               w_token.smart_copy(dst)))
+        dst1 = self.weight_load_dst
+        dst2 = self.compute
+        weight_read_buf.store((w_ln.smart_copy(dst2), b_ln.smart_copy(dst2),
+                               w_token.smart_copy(dst1)))
         
     def input_act_shape_and_dtype(self, batch_size, seq_len):
         return (batch_size, seq_len, self.config.input_dim), self.config.dtype
@@ -188,6 +193,8 @@ class OutputEmbed(BaseModel):
         inputs.delete()
         
         # output embedding
+        if w_token.device.DeviceType == DeviceType.COMPRESSED:
+            w_token = w_token.device.decompress(w_token)
         logits = F.linear(x, w_token.data)
         last_token_logits = logits[:,-1,:]
         
@@ -217,8 +224,11 @@ class SelfAttention(BaseModel):
         self.policy = policy
         self.layer_idx = layer_idx
         self.compute = env.cpu
-        self.weight_load_dst = self.compute
+        self.weight_load_dst = self.compute.compressed_device if policy.comp_weight else self.compute
         self.attention_compute = self.compute
+        
+        from flexgen.torch_backend import global_cpu_device
+        self.compressed_device = global_cpu_device.compressed_device
         
     def init_weight(self, weight_home: ValueHolder, path:str)-> None:
         """Load weights to DISK/CPU/(GPU) according to the policy."""
@@ -256,17 +266,15 @@ class SelfAttention(BaseModel):
         """Load weights from DISK/CPU/(GPU) to CPU/(GPU) according to the policy."""
         if batch_idx != 0: return
         w_q, b_q, w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln = weight_home.val
-        dst = self.weight_load_dst
-        weight_read_buf.store((w_q.smart_copy(dst),
-                               b_q.smart_copy(dst),
-                               w_k.smart_copy(dst),
-                               b_k.smart_copy(dst),
-                               w_v.smart_copy(dst),
-                               b_v.smart_copy(dst),
-                               w_out.smart_copy(dst),
-                               b_out.smart_copy(dst),
-                               w_ln.smart_copy(dst),
-                               b_ln.smart_copy(dst)))
+        
+        dst1 = self.weight_load_dst
+        dst2 = self.compute
+        weight_read_buf.store((
+            w_q.smart_copy(dst1), b_q.smart_copy(dst2),
+            w_k.smart_copy(dst1), b_k.smart_copy(dst2),
+            w_v.smart_copy(dst1), b_v.smart_copy(dst2),
+            w_out.smart_copy(dst1), b_out.smart_copy(dst2),
+            w_ln.smart_copy(dst2), b_ln.smart_copy(dst2)))
         
     def init_cache_one_batch(self, cache_home: ValueHolder):
         device: Union[TorchDevice, TorchDisk, TorchMixedDevice] = None
@@ -276,6 +284,10 @@ class SelfAttention(BaseModel):
             device = self.env.disk
         else:
             device = self.env.mixed
+            
+        if self.policy.comp_cache:
+            assert device.DeviceType != DeviceType.MIXED, "Do not support compress cache and mixed device cache"
+            device = device.compressed_device
             
         cache = device.init_cache_one_batch(self.config,
                                             self.task,
@@ -290,13 +302,22 @@ class SelfAttention(BaseModel):
         if token_idx == 0: return # prefill phase
         
         k_home, v_home = cache_home.val
-        dst = self.attention_compute
-        k_buf, v_buf = dst.next_attention_compute_workspace()
-        indices = (slice(0, self.task.prompt_len + token_idx - 1),
+                
+        if self.policy.comp_cache:
+            dst = self.attention_compute.compressed_device
+            indices = (slice(0, self.task.prompt_len + token_idx),
                        slice(0, k_home.shape[1]))
-        general_copy(k_buf, indices, k_home, indices)
-        general_copy(v_buf, indices, v_home, indices)
-        cache_read_buf.store(((k_buf, False), (v_buf, False)))
+            cache_read_buf.store((k_home.smart_copy(dst, indices),
+                                  v_home.smart_copy(dst, indices),))
+        
+        else:
+            dst = self.attention_compute
+            k_buf, v_buf = dst.next_attention_compute_workspace()
+            indices = (slice(0, self.task.prompt_len + token_idx - 1),
+                        slice(0, k_home.shape[1]))
+            general_copy(k_buf, indices, k_home, indices)
+            general_copy(v_buf, indices, v_home, indices)
+            cache_read_buf.store(((k_buf, False), (v_buf, False)))
         
     def store_cache(self,
                     cache_home: ValueHolder,
@@ -336,8 +357,16 @@ class SelfAttention(BaseModel):
             w_ln: TorchTensor,
             b_ln: TorchTensor,
             n_head: int,
-            donate: list):
+            donate: list,
+            compress_cache,
+            comp_config):
         """Multi-head attention (prefill phase)."""
+        
+        if w_q.device.DeviceType == DeviceType.COMPRESSED:
+            w_q = w_q.device.decompress(w_q)
+            w_k = w_k.device.decompress(w_k)
+            w_v = w_v.device.decompress(w_v)
+            w_out = w_out.device.decompress(w_out)
         
         b, s, h = inputs.shape
         head_dim = h // n_head
@@ -389,8 +418,12 @@ class SelfAttention(BaseModel):
         k = k.permute(2, 0, 1)
         v = v.permute(1, 0, 2)
 
-        k = TorchTensor.create_from_torch(k, self.compute)
-        v = TorchTensor.create_from_torch(v, self.compute)
+        if compress_cache:
+            k = self.compressed_device.compress(k, comp_config)
+            v = self.compressed_device.compress(v, comp_config)
+        else:
+            k = TorchTensor.create_from_torch(k, self.compute)
+            v = TorchTensor.create_from_torch(v, self.compute)
 
         return TorchTensor.create_from_torch(value, self.compute), k, v
 
@@ -410,8 +443,17 @@ class SelfAttention(BaseModel):
                 n_head: int,
                 k_cache: TorchTensor,
                 v_cache: TorchTensor,
-                donate: list):
+                donate: list,
+                compress_cache,
+                comp_config):
         """Multi-head attention (decoding phase)."""
+        if w_q.device.DeviceType == DeviceType.COMPRESSED:
+            w_q = w_q.device.decompress(w_q)
+            w_k = w_k.device.decompress(w_k)
+            w_v = w_v.device.decompress(w_v)
+            w_out = w_out.device.decompress(w_out)
+        
+        
         b, tgt_s, h = inputs.shape
         src_s = attention_mask.shape[1]
         head_dim = h // n_head
@@ -434,10 +476,16 @@ class SelfAttention(BaseModel):
         k_new = k.permute(1, 0, 2, 3).reshape(tgt_s, b * n_head, head_dim)
         # shape: (1, b * n_head, head_dim)
         v_new = v.permute(1, 0, 2, 3).reshape(tgt_s, b * n_head, head_dim)
-
-        # shape: (s, b * n_head, head_dim)
-        k = k_cache.data[:src_s]
-        v = v_cache.data[:src_s]
+        
+        if compress_cache:
+            # shape: (s, b * n_head, head_dim)
+            k = k_cache.device.decompress(k_cache)[:src_s]
+            v = v_cache.device.decompress(v_cache)[:src_s]
+        else:
+            # shape: (s, b * n_head, head_dim)
+            k = k_cache.data[:src_s]
+            v = v_cache.data[:src_s]
+            
         k[src_s - 1:src_s] = k_new
         v[src_s - 1:src_s] = v_new
 
@@ -457,8 +505,19 @@ class SelfAttention(BaseModel):
         if donate[0]: inputs.delete()
         if donate[1]: attention_mask.delete()
 
-        k_new = TorchTensor.create_from_torch(k_new, self.compute)
-        v_new = TorchTensor.create_from_torch(v_new, self.compute)
+        # k_new = TorchTensor.create_from_torch(k_new, self.compute)
+        # v_new = TorchTensor.create_from_torch(v_new, self.compute)
+        
+        if compress_cache:
+            if comp_config.group_dim == 0:
+                s_ = src_s // comp_config.group_size * comp_config.group_size
+                k_new = k[:, :, s_:].permute(2, 0, 1)
+                v_new = v[:, s_:, :].permute(1, 0, 2)
+            k_new = self.compressed_device.compress(k_new, comp_config)
+            v_new = self.compressed_device.compress(v_new, comp_config)
+        else:
+            k_new = TorchTensor.create_from_torch(k_new, self.compute)
+            v_new = TorchTensor.create_from_torch(v_new, self.compute)
 
         return TorchTensor.create_from_torch(value, self.compute), k_new, v_new
 
@@ -506,14 +565,16 @@ class SelfAttention(BaseModel):
         if token_idx == 0:  # prefill
             mask, donate[1] = attention_mask.val.smart_copy(self.compute)
             h, new_k_cache, new_v_cache = self.mha(h, mask, w_q, b_q,
-                w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head, donate)
+                w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head, donate,
+                self.policy.comp_cache, self.policy.comp_cache_config)
             cache_write_buf.store((new_k_cache, new_v_cache))
         else:  # decoding
             mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
             (k_cache, donate[12]), (v_cache, donate[13]) = cache_read_buf.pop()
             h, new_k_cache, new_v_cache = self.mha_gen(h, mask, w_q,
                 b_q, w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head,
-                k_cache, v_cache, donate)
+                k_cache, v_cache, donate,
+                self.policy.comp_cache, self.policy.comp_cache_config)
             cache_write_buf.store((new_k_cache, new_v_cache))
 
         hidden.val = h
@@ -531,7 +592,8 @@ class MLP(BaseModel):
         self.policy = policy
         self.layer_idx = layer_idx
         self.compute = env.cpu
-        self.weight_load_dst = self.compute
+        self.weight_load_dst = (self.compute.compressed_device if policy.comp_weight
+            else self.compute)
         
     def init_weight(self, weight_home: ValueHolder, path:str)-> None:
         h, dtype = (self.config.input_dim, self.config.dtype)
@@ -558,19 +620,23 @@ class MLP(BaseModel):
                     weight_read_buf: ValueHolder,
                     batch_idx: int) -> None:
         """Load weights from DISK/CPU/(GPU) to CPU/(GPU) according to the policy."""
+        if batch_idx != 0: return
         wi, bi, wo, bo, w_ln, b_ln = weight_home.val
-        if batch_idx == 0:
-            dst1 = self.weight_load_dst
-            dst2 = self.compute
-            weight_read_buf.store((
-                wi.smart_copy(dst1), bi.smart_copy(dst2),
-                wo.smart_copy(dst1), bo.smart_copy(dst2),
-                w_ln.smart_copy(dst2), b_ln.smart_copy(dst2)))
+        dst1 = self.weight_load_dst
+        dst2 = self.compute
+        weight_read_buf.store((
+            wi.smart_copy(dst1), bi.smart_copy(dst2),
+            wo.smart_copy(dst1), bo.smart_copy(dst2),
+            w_ln.smart_copy(dst2), b_ln.smart_copy(dst2)))
     
     def input_act_shape_and_dtype(self, batch_size, seq_len):
         return (batch_size, seq_len, self.config.input_dim), self.config.dtype
     
     def mlp(self, inputs, wi, bi, wo, bo, w_ln, b_ln, donate):
+        if wi.device.DeviceType == DeviceType.COMPRESSED:
+            wi = wi.device.decompress(wi)
+            wo = wo.device.decompress(wo)
+            
         b, s, h = inputs.shape
 
         out = F.layer_norm(inputs.data, (h,), weight=w_ln.data, bias=b_ln.data)
@@ -1010,7 +1076,8 @@ class OptLM:
             if num_batches == 1:
                 self.generation_loop_overlap_single_batch()
             else:
-                self.generation_loop_overlap_multi_batch()
+                raise NotImplementedError("Only support num_batches=1 for now")
+                # self.generation_loop_overlap_multi_batch()
         
         # Delete cache
         for j in range(num_layers):

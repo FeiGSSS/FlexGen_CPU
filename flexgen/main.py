@@ -9,12 +9,18 @@ from flexgen.utils import (
     GB, DUMMY_WEIGHT,
     project_decode_latency, write_benchmark_log
 )
-from flexgen.torch_backend import TorchDevice, TorchDisk, TorchMixedDevice, AsyncIOManager
+from flexgen.torch_backend import (TorchDevice,
+                                   TorchDisk,
+                                   TorchMixedDevice,
+                                   AsyncIOManager,
+                                   fix_recursive_import)
+
 from flexgen.opt_config import get_opt_config
+from flexgen.compression import CompressionConfig
 from flexgen.model.model import OptLM
 from flexgen.timer import timers
 
-
+fix_recursive_import()
 
 
 def get_filename(args):
@@ -26,6 +32,12 @@ def get_filename(args):
                f"ngbs{args.num_batches}-" \
                f"prompt{args.prompt_len}-" \
                f"gen{args.gen_len}-percent-{percent}"
+               
+    if args.compress_weight:
+        filename += "-compw"
+    if args.compress_cache:
+        filename += "-compc"
+        
     return filename
 
 
@@ -60,7 +72,15 @@ def run_flexllmgen(args):
                     args.percent[2],
                     args.overlap,
                     args.sep_layer,
-                    args.attn_sparsity)
+                    args.attn_sparsity,
+                    args.compress_weight,
+                    CompressionConfig(num_bits=4, group_size=64,
+                                      group_dim=0, symmetric=False),
+                    args.compress_cache,
+                    CompressionConfig(num_bits=4, group_size=64,
+                                      group_dim=2, symmetric=False))
+    
+    assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
 
     opt_config = get_opt_config(args.model)
     cache_size = opt_config.cache_bytes(num_prompts, prompt_len + gen_len)
@@ -146,6 +166,10 @@ def add_parser_arguments(parser):
     parser.add_argument("--sep_layer", type=str2bool, nargs='?',
         const=True, default=True)
     parser.add_argument("--attn_sparsity", type=float, default=1.0)
+    parser.add_argument("--compress_weight", action="store_true",
+        help="Whether to compress weight.")
+    parser.add_argument("--compress_cache", action="store_true",
+        help="Whether to compress cache.")
 
 
     parser.add_argument("--log_file", type=str, default="auto")
@@ -154,11 +178,14 @@ def add_parser_arguments(parser):
 
     parser.add_argument("--overlap", type=str2bool, nargs='?',
         const=True, default=True)
+    
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     add_parser_arguments(parser)
     args = parser.parse_args()
+    
+    assert not args.compress_weight, "compress_weight is Not support Now"
 
     run_flexllmgen(args)

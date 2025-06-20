@@ -85,6 +85,14 @@ class Policy:
 
     # Sparsity of attention weights
     attn_sparsity: float
+    
+    # Compress weights with group-wise quantization
+    comp_weight: bool
+    comp_weight_config: Any
+
+    # Compress KV cache with group-wise quantization
+    comp_cache: bool
+    comp_cache_config: Any
 
     @property
     def w_disk_percent(self):

@@ -6,9 +6,8 @@ import queue
 import threading
 
 from enum import Enum, auto
-from typing import Union, Tuple, List
+from typing import Union, Tuple, List, Any
 from itertools import  count
-
 
 import numpy as np
 import torch
@@ -24,10 +23,20 @@ from flexgen.utils import (
 )
 from flexgen.opt_config import OptConfig
 
+general_copy_compressed = TorchCompressedDevice = None
+global_cpu_device = None
+
+def fix_recursive_import():
+    global general_copy_compressed, TorchCompressedDevice, global_cpu_device
+    from flexgen import compression
+    general_copy_compressed = compression.general_copy_compressed
+    TorchCompressedDevice = compression.TorchCompressedDevice
+
 class DeviceType(Enum):
     CPU = auto()
     DISK = auto()
     MIXED = auto()  # For TorchMixedDevice, which manages multiple devices
+    COMPRESSED = auto()
 
     @staticmethod
     def convert(name: str):
@@ -37,6 +46,8 @@ class DeviceType(Enum):
             return DeviceType.DISK
         elif name == "mixed":
             return DeviceType.MIXED
+        elif name == "compressed":
+            return DeviceType.COMPRESSED
         else:
             raise NotImplementedError(f"DeviceType {name} not implemented")
         
@@ -46,7 +57,7 @@ class TorchTensor():
         self,
         shape: Tuple,
         dtype: torch.dtype,
-        data: Union[torch.Tensor, str],
+        data: Any,
         device: Union[TorchDevice, TorchDisk, TorchMixedDevice],
         name: str = None
     ):
@@ -90,7 +101,12 @@ class TorchTensor():
             with open(self.data, "wb") as f:
                 np.save(f, np_array)
         else:
-            self.data.copy_(torch.from_numpy(np_array))
+            if self.device.DeviceType == DeviceType.COMPRESSED:
+                tmp = torch.from_numpy(np_array)
+                tmp = global_cpu_device.compressed_device.compress(tmp, self.data[2])
+                general_copy(self, None, tmp, None)
+            else:
+                self.data.copy_(torch.from_numpy(np_array))
     
     def load_from_np_file(self, file_name: str):
         if self.device.DeviceType == DeviceType.DISK:
@@ -109,7 +125,10 @@ class TorchTensor():
             shape = tuple(x.stop - x.start for x in src_indices) + self.shape[len(src_indices):]
         else:
             shape = self.shape
-        ret = dst.allocate(shape, torch_dtype_to_np_dtype[self.dtype])
+        if dst.DeviceType == DeviceType.COMPRESSED:
+            ret = dst.allocate(shape, torch_dtype_to_np_dtype[self.dtype], self.data[2])
+        else:
+            ret = dst.allocate(shape, torch_dtype_to_np_dtype[self.dtype])
         general_copy(ret, None, self, src_indices)
         return ret
     
@@ -148,8 +167,14 @@ class TorchDevice:
         self.dev = torch.device(name)
         self.DeviceType: DeviceType = DeviceType.convert(self.dev.type)
         
+        self.compressed_device = TorchCompressedDevice(self)
+        
         self.attention_compute_workspace = None
         self.workspace_pointer = None
+        
+        if self.DeviceType == DeviceType.CPU:
+            global global_cpu_device
+            global_cpu_device = self
         
     def allocate(self,
                  shape: Tuple,
@@ -167,19 +192,22 @@ class TorchDevice:
         if self.DeviceType != DeviceType.CPU:
             return  # Only CPU requires this fp32 workspace
         
-        batch_size = policy.batch_size
-        n_head = config.n_head
-        head_dim = config.input_dim // n_head
-        max_seq_len = task.prompt_len + task.gen_len - 1
-        self.attention_compute_workspace = []
-        self.workspace_pointer = 0
-        # We currently separate SelfAttention and MLP as two layers,
-        # so we only need one workspace instead of two.
-        for i in range(1 if policy.sep_layer else 2):
-            shape = (max_seq_len, batch_size * n_head, head_dim)
-            k_cache = self.allocate(shape, np.float32)
-            v_cache = self.allocate(shape, np.float32)
-            self.attention_compute_workspace.append((k_cache, v_cache))
+        if not policy.comp_cache:
+            batch_size = policy.batch_size
+            n_head = config.n_head
+            head_dim = config.input_dim // n_head
+            max_seq_len = task.prompt_len + task.gen_len - 1
+            self.attention_compute_workspace = []
+            self.workspace_pointer = 0
+            # We currently separate SelfAttention and MLP as two layers,
+            # so we only need one workspace instead of two.
+            for i in range(1 if policy.sep_layer else 2):
+                shape = (max_seq_len, batch_size * n_head, head_dim)
+                k_cache = self.allocate(shape, np.float32)
+                v_cache = self.allocate(shape, np.float32)
+                self.attention_compute_workspace.append((k_cache, v_cache))
+        else:
+            self.compressed_device.init_attention_compute_workspace(config, task, policy)
 
     def next_attention_compute_workspace(self) -> Tuple[TorchTensor, TorchTensor]:
         self.workspace_pointer = (self.workspace_pointer + 1) % len(
@@ -216,8 +244,8 @@ class TorchDevice:
         batch_size = policy.batch_size
         
         shape = (prompt_len + gen_len - 1, batch_size * n_head, hidden_size // n_head)
-        k_cache = self.allocate(shape, np.float16)
-        v_cache = self.allocate(shape, np.float16)
+        k_cache = self.allocate(shape, np.float32)
+        v_cache = self.allocate(shape, np.float32)
 
         return k_cache, v_cache
     
@@ -264,6 +292,9 @@ class TorchDisk:
         self.path = os.path.abspath(os.path.expanduser(path))
         self.mem_capacity = mem_capacity
         
+        from flexgen.compression import TorchCompressedDevice
+        self.compressed_device = TorchCompressedDevice(self)
+        
         self.DeviceType: DeviceType = DeviceType.DISK
         
     def allocate(self,
@@ -300,8 +331,8 @@ class TorchDisk:
         batch_size = policy.batch_size
         
         shape = (prompt_len + gen_len - 1, batch_size * n_head, hidden_size // n_head)
-        k_cache = self.allocate(shape, np.float16)
-        v_cache = self.allocate(shape, np.float16)
+        k_cache = self.allocate(shape, np.float32)
+        v_cache = self.allocate(shape, np.float32)
         return k_cache, v_cache
     
     def mem_stats(self):
@@ -370,8 +401,8 @@ class TorchMixedDevice:
             len_disk = shape[SEG_DIM] - len_cpu
         lens = [len_cpu, len_disk]
 
-        k_cache = self.allocate(shape, np.float16, seg_lengths=lens)
-        v_cache = self.allocate(shape, np.float16, seg_lengths=lens)
+        k_cache = self.allocate(shape, np.float32, seg_lengths=lens)
+        v_cache = self.allocate(shape, np.float32, seg_lengths=lens)
         return k_cache, v_cache
 
 
@@ -415,7 +446,10 @@ def general_copy(dst: TorchTensor, dst_indices: Tuple[slice],
                 base=seg_points[i])
             tmp_dst_indices = cut_indices(dst_indices, seg_points[i], seg_points[i+1])
             general_copy(dst, tmp_dst_indices, src.data[0][i], tmp_src_indices)
-    
+    elif (src.device.DeviceType == DeviceType.COMPRESSED or
+          dst.device.DeviceType == DeviceType.COMPRESSED):
+        # The tensor is compressed, do recursive calls
+        general_copy_compressed(dst, dst_indices, src, src_indices)
     else:
         # print(dst, src)
         async_io_manager.submit_copy(dst, dst_indices, src, src_indices)
