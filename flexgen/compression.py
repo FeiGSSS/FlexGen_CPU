@@ -73,8 +73,8 @@ class TorchCompressedDevice:
                                          task,
                                          policy):
 
-        if self.base_device.DeviceType != DeviceType.CPU:
-            return  # Only CPU requires this fp32 workspace
+        if not self.base_device.DeviceType.is_numa_device():
+            return  # Only NUMA devices require this fp32 workspace
 
         batch_size = policy.batch_size
         n_head = config.n_head

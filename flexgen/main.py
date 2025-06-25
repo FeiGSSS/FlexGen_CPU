@@ -15,7 +15,8 @@ from flexgen.torch_backend import (TorchDevice,
                                    TorchDisk,
                                    TorchMixedDevice,
                                    AsyncIOManager,
-                                   fix_recursive_import)
+                                   fix_recursive_import,
+                                   DeviceType, init_numa_support)
 
 from flexgen.opt_config import get_opt_config
 from flexgen.compression import CompressionConfig
@@ -23,6 +24,75 @@ from flexgen.model.model import OptLM
 from flexgen.timer import timers
 
 fix_recursive_import()
+
+
+def parse_device_config(device_str):
+    """
+    Parse device configuration string like 'numa0:50,numa1:30,disk:20'
+    Returns dict: {'numa0': 50, 'numa1': 30, 'disk': 20}
+    """
+    if not device_str:
+        return {}
+    
+    config = {}
+    for item in device_str.split(','):
+        if ':' not in item:
+            raise ValueError(f"Invalid device config format: {item}. Expected 'device:percentage'")
+        device, percent_str = item.split(':', 1)
+        device = device.strip()
+        try:
+            percent = int(percent_str.strip())
+        except ValueError:
+            raise ValueError(f"Invalid percentage: {percent_str}")
+        
+        if percent < 0 or percent > 100:
+            raise ValueError(f"Percentage must be 0-100, got {percent}")
+        
+        config[device] = percent
+    
+    # Validate that percentages sum to 100
+    total = sum(config.values())
+    if total != 100:
+        raise ValueError(f"Device percentages must sum to 100, got {total}")
+    
+    return config
+
+
+def convert_legacy_percent_to_device_config(percent_args):
+    """
+    Convert legacy --percent arguments to new device config format
+    percent_args: [weight_cpu_percent, cache_cpu_percent, activation_cpu_percent]
+    """
+    if len(percent_args) != 3:
+        raise ValueError("Legacy percent format requires exactly 3 values")
+    
+    w_cpu, cache_cpu, act_cpu = percent_args
+    
+    device_config = {
+        'weight': {},
+        'cache': {},
+        'activation': {}
+    }
+    
+    # Weight distribution
+    if w_cpu > 0:
+        device_config['weight']['numa0'] = w_cpu
+    if w_cpu < 100:
+        device_config['weight']['disk'] = 100 - w_cpu
+    
+    # Cache distribution  
+    if cache_cpu > 0:
+        device_config['cache']['numa0'] = cache_cpu
+    if cache_cpu < 100:
+        device_config['cache']['disk'] = 100 - cache_cpu
+    
+    # Activation distribution
+    if act_cpu > 0:
+        device_config['activation']['numa0'] = act_cpu
+    if act_cpu < 100:
+        device_config['activation']['disk'] = 100 - act_cpu
+        
+    return device_config
 
 
 def get_filename(args):
@@ -52,6 +122,42 @@ def get_test_inputs(prompt_len, num_prompts, tokenizer):
 
 def run_flexllmgen(args):
     print(f"<run_flexllmgen>: args.model: {args.model}")
+    
+    # Initialize NUMA support
+    init_numa_support()
+    
+    # Process device configuration
+    device_config = None
+    if any([args.device_config, args.weight_devices, args.cache_devices, args.activation_devices]):
+        # Use new NUMA-aware configuration
+        device_config = {
+            'weight': {},
+            'cache': {},
+            'activation': {}
+        }
+        
+        if args.device_config:
+            # Parse comprehensive device config
+            parts = args.device_config.split()
+            for part in parts:
+                if ':' not in part:
+                    continue
+                comp_type, devices = part.split(':', 1)
+                device_config[comp_type] = parse_device_config(devices)
+        else:
+            # Parse individual device configs
+            if args.weight_devices:
+                device_config['weight'] = parse_device_config(args.weight_devices)
+            if args.cache_devices:
+                device_config['cache'] = parse_device_config(args.cache_devices)
+            if args.activation_devices:
+                device_config['activation'] = parse_device_config(args.activation_devices)
+    else:
+        # Use legacy percent configuration
+        device_config = convert_legacy_percent_to_device_config(args.percent)
+        
+    print(f"Device configuration: {device_config}")
+    
     if args.model == "facebook/galactica-30b":
         tokenizer = AutoTokenizer.from_pretrained("facebook/galactica-30b", padding_side="left")
     else:
@@ -67,20 +173,21 @@ def run_flexllmgen(args):
     disk = TorchDisk(args.offload_dir)
     env = ExecutionEnv(cpu=cpu, disk=disk, mixed=TorchMixedDevice([cpu, disk]))
 
-    policy = Policy(args.batch_size,
-                    args.num_batches,
-                    args.percent[0],
-                    args.percent[1],
-                    args.percent[2],
-                    args.overlap,
-                    args.sep_layer,
-                    args.attn_sparsity,
-                    args.compress_weight,
-                    CompressionConfig(num_bits=4, group_size=64,
-                                      group_dim=0, symmetric=False),
-                    args.compress_cache,
-                    CompressionConfig(num_bits=4, group_size=64,
-                                      group_dim=2, symmetric=False))
+    # Create policy using new device configuration
+    policy = Policy.create_from_device_config(
+        batch_size=args.batch_size,
+        num_batches=args.num_batches,
+        device_config=device_config,
+        overlap=args.overlap,
+        sep_layer=args.sep_layer,
+        attn_sparsity=args.attn_sparsity,
+        comp_weight=args.compress_weight,
+        comp_weight_config=CompressionConfig(num_bits=4, group_size=64,
+                                           group_dim=0, symmetric=False),
+        comp_cache=args.compress_cache,
+        comp_cache_config=CompressionConfig(num_bits=4, group_size=64,
+                                          group_dim=2, symmetric=False)
+    )
     
     assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
 
@@ -169,6 +276,18 @@ def add_parser_arguments(parser):
          "the percentage of weight on CPU, "
          "the percentage of attention cache on CPU, "
          "the percentage of activations on CPU")
+    
+    # New NUMA-aware device configuration
+    parser.add_argument("--device-config", type=str, default=None,
+        help="NUMA-aware device configuration. Format: "
+             "'weight:numa0=50,numa1=30,disk=20 cache:numa0=70,numa1=30 activation:numa0=100'")
+    parser.add_argument("--weight-devices", type=str, default=None,
+        help="Weight placement. Format: 'numa0:50,numa1:30,disk:20'")
+    parser.add_argument("--cache-devices", type=str, default=None,
+        help="Cache placement. Format: 'numa0:70,numa1:30'")
+    parser.add_argument("--activation-devices", type=str, default=None,
+        help="Activation placement. Format: 'numa0:100'")
+    
     parser.add_argument("--sep_layer", type=str2bool, nargs='?',
         const=True, default=True)
     parser.add_argument("--attn_sparsity", type=float, default=1.0)

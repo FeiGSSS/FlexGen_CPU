@@ -72,7 +72,7 @@ class Policy:
     batch_size: int
     num_batches: int
 
-    # percent = a means a%
+    # Legacy percent format for backward compatibility
     w_cpu_percent: float
     cache_cpu_percent: float
     act_cpu_percent: float
@@ -93,6 +93,9 @@ class Policy:
     # Compress KV cache with group-wise quantization
     comp_cache: bool
     comp_cache_config: Any
+    
+    # New NUMA-aware device configuration
+    device_config: Any = None  # Dict containing device placement configuration
 
     @property
     def w_disk_percent(self):
@@ -105,6 +108,62 @@ class Policy:
     @property
     def act_disk_percent(self):
         return 100 - self.act_cpu_percent
+    
+    def get_device_percent(self, component: str, device: str) -> float:
+        """Get percentage for a specific component and device"""
+        if self.device_config and component in self.device_config:
+            return self.device_config[component].get(device, 0)
+        else:
+            # Fallback to legacy percent format
+            if device == 'numa0':
+                if component == 'weight':
+                    return self.w_cpu_percent
+                elif component == 'cache':
+                    return self.cache_cpu_percent
+                elif component == 'activation':
+                    return self.act_cpu_percent
+            elif device == 'disk':
+                if component == 'weight':
+                    return self.w_disk_percent
+                elif component == 'cache':
+                    return self.cache_disk_percent
+                elif component == 'activation':
+                    return self.act_disk_percent
+            return 0
+    
+    @classmethod
+    def create_from_device_config(cls, 
+                                 batch_size: int,
+                                 num_batches: int,
+                                 device_config: dict,
+                                 overlap: bool,
+                                 sep_layer: bool,
+                                 attn_sparsity: float,
+                                 comp_weight: bool,
+                                 comp_weight_config: Any,
+                                 comp_cache: bool,
+                                 comp_cache_config: Any):
+        """Create Policy from new device configuration format"""
+        # Extract legacy percentages for backward compatibility
+        w_cpu_percent = device_config.get('weight', {}).get('numa0', 0)
+        cache_cpu_percent = device_config.get('cache', {}).get('numa0', 0)
+        act_cpu_percent = device_config.get('activation', {}).get('numa0', 0)
+        
+        return cls(
+            batch_size=batch_size,
+            num_batches=num_batches,
+            w_cpu_percent=w_cpu_percent,
+            cache_cpu_percent=cache_cpu_percent,
+            act_cpu_percent=act_cpu_percent,
+            overlap=overlap,
+            sep_layer=sep_layer,
+            attn_sparsity=attn_sparsity,
+            comp_weight=comp_weight,
+            comp_weight_config=comp_weight_config,
+            comp_cache=comp_cache,
+            comp_cache_config=comp_cache_config,
+            device_config=device_config
+        )
     
     
 def cpu_mem_stats() -> int:

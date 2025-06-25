@@ -4,13 +4,39 @@ import os
 import shutil
 import queue
 import threading
+import sys
 
 from enum import Enum, auto
-from typing import Union, Tuple, List, Any
+from typing import Union, Tuple, List, Any, Dict
 from itertools import  count
 
 import numpy as np
 import torch
+
+# NUMA support
+NUMA_AVAILABLE = False
+NUMA_NODES = 0
+torch_numa = None
+
+def init_numa_support():
+    """Initialize NUMA support if available"""
+    global NUMA_AVAILABLE, NUMA_NODES, torch_numa
+    try:
+        numa_project_path = os.path.join(os.path.dirname(__file__), '..', 'numa_project')
+        if numa_project_path not in sys.path:
+            sys.path.insert(0, numa_project_path)
+        import torch_numa as _torch_numa
+        torch_numa = _torch_numa
+        NUMA_AVAILABLE = True
+        NUMA_NODES = torch_numa.get_numa_nodes()
+        torch_numa.register_numa_allocator()
+        print(f"NUMA support enabled with {NUMA_NODES} nodes")
+        return True
+    except Exception as e:
+        print(f"NUMA support not available: {e}")
+        NUMA_AVAILABLE = False
+        NUMA_NODES = 0
+        return False
 
 from flexgen.utils import (
     Policy,
@@ -33,24 +59,66 @@ def fix_recursive_import():
     TorchCompressedDevice = compression.TorchCompressedDevice
 
 class DeviceType(Enum):
-    CPU = auto()
+    # NUMA节点 - 动态生成
+    NUMA0 = auto()
+    NUMA1 = auto() 
+    NUMA2 = auto()
+    NUMA3 = auto()
+    NUMA4 = auto()
+    NUMA5 = auto()
+    NUMA6 = auto()
+    NUMA7 = auto()
+    # 其他设备类型
     DISK = auto()
     MIXED = auto()  # For TorchMixedDevice, which manages multiple devices
     COMPRESSED = auto()
 
     @staticmethod
     def convert(name: str):
-        if name == "cpu":
-            return DeviceType.CPU
-        elif name == "disk":
+        """Convert string name to DeviceType"""
+        name = name.lower()
+        if name == "disk":
             return DeviceType.DISK
         elif name == "mixed":
             return DeviceType.MIXED
         elif name == "compressed":
             return DeviceType.COMPRESSED
+        elif name.startswith("numa"):
+            try:
+                numa_id = int(name[4:])  # Extract number from "numa0", "numa1", etc.
+                return getattr(DeviceType, f"NUMA{numa_id}")
+            except (ValueError, AttributeError):
+                raise ValueError(f"Invalid NUMA device name: {name}")
+        # 向后兼容：将原来的"cpu"映射到numa0
+        elif name == "cpu":
+            print("Warning: 'cpu' device type is deprecated, using 'numa0' instead")
+            return DeviceType.NUMA0
         else:
-            raise NotImplementedError(f"DeviceType {name} not implemented")
+            raise ValueError(f"Unknown device type: {name}")
+    
+    @staticmethod
+    def get_available_numa_devices():
+        """Get list of available NUMA device types based on system"""
+        if not NUMA_AVAILABLE:
+            return [DeviceType.NUMA0]  # Fallback to single node
         
+        available = []
+        for i in range(min(NUMA_NODES, 8)):  # Max 8 NUMA nodes supported
+            available.append(getattr(DeviceType, f"NUMA{i}"))
+        return available
+    
+    def to_numa_node_id(self) -> int:
+        """Convert DeviceType to NUMA node ID"""
+        if self.name.startswith("NUMA"):
+            return int(self.name[4:])
+        else:
+            raise ValueError(f"Not a NUMA device type: {self}")
+    
+    def is_numa_device(self) -> bool:
+        """Check if this is a NUMA device type"""
+        return self.name.startswith("NUMA")
+
+
 class TorchTensor():
     name_count = count()
     def __init__(
@@ -158,21 +226,49 @@ class TorchTensor():
 ########### TorchDevice ###########
 
 class TorchDevice:
-    """Wrap tensor APIs of a single CPU"""
-    def __init__(self, name: str, mem_capacity: int = None, flops=None):
+    """Wrap tensor APIs of a single device (NUMA node or traditional CPU)"""
+    def __init__(self, name: str, mem_capacity: int = None, flops=None, numa_node: int = None):
         self.name = name
         self.mem_capacity = mem_capacity
         self.flops = flops
+        self.numa_node = numa_node
         
-        self.dev = torch.device(name)
-        self.DeviceType: DeviceType = DeviceType.convert(self.dev.type)
+        # Ensure recursive imports are resolved
+        if TorchCompressedDevice is None:
+            fix_recursive_import()
+        
+        # Handle different device types
+        if numa_node is not None:
+            # Explicit NUMA node specified
+            self.dev = torch.device("cpu")
+            self.DeviceType = getattr(DeviceType, f"NUMA{numa_node}")
+        elif name.startswith("numa"):
+            # NUMA device specified by name
+            self.DeviceType = DeviceType.convert(name)
+            self.numa_node = self.DeviceType.to_numa_node_id()
+            self.dev = torch.device("cpu")
+        elif name == "cpu":
+            # Legacy CPU - convert to NUMA0 with warning
+            self.DeviceType = DeviceType.convert(name)  # This will show warning
+            self.numa_node = 0
+            self.dev = torch.device("cpu")
+        else:
+            # Non-NUMA device (disk, etc.)
+            self.dev = torch.device(name)
+            self.DeviceType = DeviceType.convert(name)
+            self.numa_node = None
+        
+        # Initialize NUMA support if needed
+        if self.DeviceType.is_numa_device() and not NUMA_AVAILABLE:
+            init_numa_support()
         
         self.compressed_device = TorchCompressedDevice(self)
         
         self.attention_compute_workspace = None
         self.workspace_pointer = None
         
-        if self.DeviceType == DeviceType.CPU:
+        # Set global CPU device for compatibility (use NUMA0)
+        if self.DeviceType == DeviceType.NUMA0:
             global global_cpu_device
             global_cpu_device = self
         
@@ -181,7 +277,14 @@ class TorchDevice:
                  dtype: np.dtype,
                  name: str = None) -> TorchTensor:        
         dtype = np_dtype_to_torch_dtype[dtype]
-        data = torch.empty(shape, dtype=dtype, device=self.dev)
+        
+        # Use NUMA-aware allocation if this is a NUMA device
+        if self.DeviceType.is_numa_device() and NUMA_AVAILABLE and torch_numa is not None:
+            data = torch_numa.empty(*shape, node=self.numa_node, dtype=dtype)
+        else:
+            # Fallback to regular allocation
+            data = torch.empty(shape, dtype=dtype, device=self.dev)
+            
         return TorchTensor.create_from_torch(data, self, name)
     
     
@@ -189,8 +292,8 @@ class TorchDevice:
                                          config: OptConfig,
                                          task: Task,
                                          policy: Policy) -> None:
-        if self.DeviceType != DeviceType.CPU:
-            return  # Only CPU requires this fp32 workspace
+        if not self.DeviceType.is_numa_device():
+            return  # Only NUMA devices require this fp32 workspace
         
         if not policy.comp_cache:
             batch_size = policy.batch_size
@@ -253,7 +356,7 @@ class TorchDevice:
         pass
     
     def mem_stats(self) -> Tuple[int, int]:
-        if self.DeviceType == DeviceType.CPU:
+        if self.DeviceType.is_numa_device():
             cur_mem = cpu_mem_stats()
             peak_mem = 0
         else:
