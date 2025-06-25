@@ -1,4 +1,6 @@
 import argparse
+import os
+import warnings
 
 from transformers import AutoTokenizer
 
@@ -131,7 +133,11 @@ def run_flexllmgen(args):
     projected = cut_gen_len
 
     if args.log_file == "auto":
-        filename = get_filename(args) + ".log"
+        # 确保logs目录存在
+        log_dir = "logs"
+        if not os.path.exists(log_dir):
+            os.makedirs(log_dir)
+        filename = os.path.join(log_dir, get_filename(args) + ".log")
     else:
         filename = args.log_file
 
@@ -182,6 +188,10 @@ def add_parser_arguments(parser):
 
 
 if __name__ == "__main__":
+    # 过滤已知的warning
+    warnings.filterwarnings("ignore", category=FutureWarning, module="torch")
+    warnings.filterwarnings("ignore", message="TypedStorage is deprecated")
+    
     parser = argparse.ArgumentParser()
     add_parser_arguments(parser)
     args = parser.parse_args()

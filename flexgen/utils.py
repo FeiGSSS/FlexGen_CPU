@@ -116,14 +116,14 @@ def cpu_mem_stats() -> int:
     visited_data = set()
     for tensor in tensors:
         # a data_ptr indicates a memory block allocated
-        data_ptr = tensor.storage().data_ptr()
+        data_ptr = tensor.untyped_storage().data_ptr()
         if data_ptr in visited_data:
             continue
         visited_data.add(data_ptr)
 
         numel = tensor.numel()
         total_numel += numel
-        element_size = tensor.storage().element_size()
+        element_size = tensor.untyped_storage().element_size()
         mem = numel * element_size
         total_mem += mem
 
