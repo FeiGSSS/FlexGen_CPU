@@ -22,14 +22,9 @@ def init_numa_support():
     """Initialize NUMA support if available"""
     global NUMA_AVAILABLE, NUMA_NODES, torch_numa
     try:
-        numa_project_path = os.path.join(os.path.dirname(__file__), '..', 'numa_project')
-        if numa_project_path not in sys.path:
-            sys.path.insert(0, numa_project_path)
-        import torch_numa as _torch_numa
-        torch_numa = _torch_numa
+        import flexgen.torch_numa as torch_numa
         NUMA_AVAILABLE = True
         NUMA_NODES = torch_numa.get_numa_nodes()
-        torch_numa.register_numa_allocator()
         print(f"NUMA support enabled with {NUMA_NODES} nodes")
         return True
     except Exception as e:
@@ -59,20 +54,15 @@ def fix_recursive_import():
     TorchCompressedDevice = compression.TorchCompressedDevice
 
 class DeviceType(Enum):
-    # NUMA节点 - 动态生成
+    # NUMA节点 - 硬编码支持最多3个
     NUMA0 = auto()
-    NUMA1 = auto() 
+    NUMA1 = auto()
     NUMA2 = auto()
-    NUMA3 = auto()
-    NUMA4 = auto()
-    NUMA5 = auto()
-    NUMA6 = auto()
-    NUMA7 = auto()
     # 其他设备类型
     DISK = auto()
-    MIXED = auto()  # For TorchMixedDevice, which manages multiple devices
+    MIXED = auto()
     COMPRESSED = auto()
-
+    
     @staticmethod
     def convert(name: str):
         """Convert string name to DeviceType"""
@@ -83,150 +73,48 @@ class DeviceType(Enum):
             return DeviceType.MIXED
         elif name == "compressed":
             return DeviceType.COMPRESSED
-        elif name.startswith("numa"):
-            try:
-                numa_id = int(name[4:])  # Extract number from "numa0", "numa1", etc.
-                return getattr(DeviceType, f"NUMA{numa_id}")
-            except (ValueError, AttributeError):
-                raise ValueError(f"Invalid NUMA device name: {name}")
-        # 向后兼容：将原来的"cpu"映射到numa0
-        elif name == "cpu":
-            print("Warning: 'cpu' device type is deprecated, using 'numa0' instead")
+        elif name == "numa0":
             return DeviceType.NUMA0
+        elif name == "numa1":
+            return DeviceType.NUMA1
+        elif name == "numa2":
+            return DeviceType.NUMA2
         else:
             raise ValueError(f"Unknown device type: {name}")
     
     @staticmethod
     def get_available_numa_devices():
         """Get list of available NUMA device types based on system"""
-        if not NUMA_AVAILABLE:
-            return [DeviceType.NUMA0]  # Fallback to single node
-        
+        numa_count = min(NUMA_NODES if NUMA_AVAILABLE else 1, 3)  # Max 3 NUMA nodes
         available = []
-        for i in range(min(NUMA_NODES, 8)):  # Max 8 NUMA nodes supported
-            available.append(getattr(DeviceType, f"NUMA{i}"))
+        for i in range(numa_count):
+            if i == 0:
+                available.append(DeviceType.NUMA0)
+            elif i == 1:
+                available.append(DeviceType.NUMA1)
+            elif i == 2:
+                available.append(DeviceType.NUMA2)
         return available
     
     def to_numa_node_id(self) -> int:
         """Convert DeviceType to NUMA node ID"""
-        if self.name.startswith("NUMA"):
-            return int(self.name[4:])
+        if self == DeviceType.NUMA0:
+            return 0
+        elif self == DeviceType.NUMA1:
+            return 1
+        elif self == DeviceType.NUMA2:
+            return 2
         else:
             raise ValueError(f"Not a NUMA device type: {self}")
     
     def is_numa_device(self) -> bool:
         """Check if this is a NUMA device type"""
-        return self.name.startswith("NUMA")
-
-
-class TorchTensor():
-    name_count = count()
-    def __init__(
-        self,
-        shape: Tuple,
-        dtype: torch.dtype,
-        data: Any,
-        device: Union[TorchDevice, TorchDisk, TorchMixedDevice],
-        name: str = None
-    ):
-        self.shape = shape
-        self.dtype = dtype
-        self.data = data
-        self.device = device
-        self.name = name or TorchTensor.next_name()
-        
-        if self.device.DeviceType == DeviceType.DISK:
-            self.delete_file = True
-
-    
-    @property
-    def bytes(self):
-        return np.prod(self.shape) * torch_dtype_to_num_bytes[self.dtype]
-    
-    @classmethod
-    def next_name(cls) -> str:
-        return f"t_{next(cls.name_count)}"
-    
-    @classmethod
-    def create_from_torch(
-        cls,
-        data: torch.Tensor,
-        device: Union[TorchDevice, TorchDisk, TorchMixedDevice],
-        name: str = None
-    ):
-        return cls(data.shape, data.dtype, data, device, name)
-    
-    def delete(self):
-        assert self.device is not None, "already deleted"
-        if self.device.DeviceType == DeviceType.DISK:
-            self.device.delete(self)
-        elif self.device.DeviceType == DeviceType.MIXED:
-            self.device.delete(self)
-        self.device = self.data = None
-            
-    def load_from_np(self, np_array:np.ndarray) -> None:
-        if self.device.DeviceType == DeviceType.DISK:
-            with open(self.data, "wb") as f:
-                np.save(f, np_array)
-        else:
-            if self.device.DeviceType == DeviceType.COMPRESSED:
-                tmp = torch.from_numpy(np_array)
-                tmp = global_cpu_device.compressed_device.compress(tmp, self.data[2])
-                general_copy(self, None, tmp, None)
-            else:
-                self.data.copy_(torch.from_numpy(np_array))
-    
-    def load_from_np_file(self, file_name: str):
-        if self.device.DeviceType == DeviceType.DISK:
-            shutil.copy(file_name, self.data)
-        else:
-            self.load_from_np(np.load(file_name))
-    
-    def copy(self,
-             dst: Union[TorchDevice, TorchDisk, TorchMixedDevice],
-             src_indices: Tuple[slice] = None) -> TorchTensor:
-        """
-        Copy the tensor to a new device or disk.
-        """
-        if src_indices:
-            assert all(x.step is None for x in src_indices), "Only support slice with step=1"
-            shape = tuple(x.stop - x.start for x in src_indices) + self.shape[len(src_indices):]
-        else:
-            shape = self.shape
-        if dst.DeviceType == DeviceType.COMPRESSED:
-            ret = dst.allocate(shape, torch_dtype_to_np_dtype[self.dtype], self.data[2])
-        else:
-            ret = dst.allocate(shape, torch_dtype_to_np_dtype[self.dtype])
-        general_copy(ret, None, self, src_indices)
-        return ret
-    
-    def smart_copy(self, dst:Union[TorchDevice, TorchDisk, TorchMixedDevice],
-                   src_indices: Tuple[slice] = None) -> Tuple[TorchTensor, bool]:
-        """
-        Smart copy the tensor to a new device or disk.
-        """
-        if self.device == dst:
-            return self, False
-        return self.copy(dst, src_indices), True
-
-    def move(self, dst: Union[TorchDevice, TorchDisk, TorchMixedDevice]) -> TorchTensor:
-        """
-        Move the tensor to a new device or disk.
-        """
-        if self.device == dst:
-            return self
-        ret = self.copy(dst)
-        self.delete()
-        return ret
-    
-    def __str__(self):
-        return (f"TorchTensor(shape={self.shape}, dtype={str(self.dtype)}, "
-                f"device={self.device.name if self.device else None})")
+        return self in [DeviceType.NUMA0, DeviceType.NUMA1, DeviceType.NUMA2]
 
 ########### TorchDevice ###########
 
 class TorchDevice:
-    """Wrap tensor APIs of a single device (NUMA node or traditional CPU)"""
+    """Wrap tensor APIs of a single NUMA device"""
     def __init__(self, name: str, mem_capacity: int = None, flops=None, numa_node: int = None):
         self.name = name
         self.mem_capacity = mem_capacity
@@ -241,16 +129,12 @@ class TorchDevice:
         if numa_node is not None:
             # Explicit NUMA node specified
             self.dev = torch.device("cpu")
-            self.DeviceType = getattr(DeviceType, f"NUMA{numa_node}")
+            self.DeviceType = DeviceType.convert(f"numa{numa_node}")
+            self.numa_node = numa_node
         elif name.startswith("numa"):
             # NUMA device specified by name
             self.DeviceType = DeviceType.convert(name)
             self.numa_node = self.DeviceType.to_numa_node_id()
-            self.dev = torch.device("cpu")
-        elif name == "cpu":
-            # Legacy CPU - convert to NUMA0 with warning
-            self.DeviceType = DeviceType.convert(name)  # This will show warning
-            self.numa_node = 0
             self.dev = torch.device("cpu")
         else:
             # Non-NUMA device (disk, etc.)
@@ -267,7 +151,7 @@ class TorchDevice:
         self.attention_compute_workspace = None
         self.workspace_pointer = None
         
-        # Set global CPU device for compatibility (use NUMA0)
+        # Set global device for compatibility (use NUMA0 as default)
         if self.DeviceType == DeviceType.NUMA0:
             global global_cpu_device
             global_cpu_device = self
@@ -278,11 +162,13 @@ class TorchDevice:
                  name: str = None) -> TorchTensor:        
         dtype = np_dtype_to_torch_dtype[dtype]
         
-        # Use NUMA-aware allocation if this is a NUMA device
-        if self.DeviceType.is_numa_device() and NUMA_AVAILABLE and torch_numa is not None:
+        # Use NUMA-aware allocation for NUMA devices
+        if self.DeviceType.is_numa_device():
+            if not NUMA_AVAILABLE or torch_numa is None:
+                raise RuntimeError(f"NUMA support required for device {self.name} but not available")
             data = torch_numa.empty(*shape, node=self.numa_node, dtype=dtype)
         else:
-            # Fallback to regular allocation
+            # Non-NUMA devices (disk, etc.)
             data = torch.empty(shape, dtype=dtype, device=self.dev)
             
         return TorchTensor.create_from_torch(data, self, name)
@@ -495,14 +381,38 @@ class TorchMixedDevice:
         batch_size = policy.batch_size
         shape = (prompt_len + gen_len - 1, batch_size * num_head, hidden_size // num_head)
 
-        # We have to round to a multiple of `num_head`
-        if policy.cache_disk_percent == 0:
-            len_cpu = shape[SEG_DIM]
-            len_disk = 0
-        else:
-            len_cpu = int(shape[SEG_DIM] * policy.cache_cpu_percent / 100) // num_head * num_head
-            len_disk = shape[SEG_DIM] - len_cpu
-        lens = [len_cpu, len_disk]
+        # Calculate cache allocation across devices
+        # Get all device configurations for cache
+        device_lens = []
+        total_percent = 0
+        
+        # Check all NUMA nodes
+        for device in self.base_devices:
+            if device.DeviceType.is_numa_device():
+                numa_id = device.DeviceType.to_numa_node_id()
+                percent = policy.get_device_percent('cache', f'numa{numa_id}')
+            elif device.DeviceType == DeviceType.DISK:
+                percent = policy.get_device_percent('cache', 'disk')
+            else:
+                percent = 0
+            
+            if percent > 0:
+                # Round to multiple of num_head for attention computation
+                device_len = int(shape[SEG_DIM] * percent / 100) // num_head * num_head
+                device_lens.append(device_len)
+                total_percent += percent
+            else:
+                device_lens.append(0)
+        
+        # Adjust for rounding errors - add remainder to first non-zero device
+        remaining = shape[SEG_DIM] - sum(device_lens)
+        if remaining > 0:
+            for i, device_len in enumerate(device_lens):
+                if device_len > 0:
+                    device_lens[i] += remaining
+                    break
+        
+        lens = device_lens
 
         k_cache = self.allocate(shape, np.float32, seg_lengths=lens)
         v_cache = self.allocate(shape, np.float32, seg_lengths=lens)
@@ -520,7 +430,7 @@ def cut_indices(indices, start, stop, base=0):
 def general_copy(dst: TorchTensor, dst_indices: Tuple[slice],
                  src: TorchTensor, src_indices: Tuple[slice]):
     # assert dst.device != src.device, "Source and destination must be different devices, NO COPY if in the same device"
-    # Currently only support DISK -> DISK or CPU -> DISK copy
+    # Currently only support DISK -> DISK or NUMA -> DISK copy
     async_io_manager = AsyncIOManager() # Sigleton instance
     if dst.device.DeviceType == DeviceType.MIXED:
         assert src.device.DeviceType != DeviceType.MIXED
@@ -560,7 +470,7 @@ def general_copy(dst: TorchTensor, dst_indices: Tuple[slice],
 class AsyncIOManager:
     """
     Asynchronous I/O manager for tensor operations using threading.
-    Handles CPU <-> Disk copies.
+    Handles NUMA <-> Disk copies.
     """
     _instance = None
 

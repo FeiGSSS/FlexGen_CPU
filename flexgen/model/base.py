@@ -47,8 +47,28 @@ class BaseModel:
                          weight_specs: List[tuple],
                          policy: Policy,
                          env: ExecutionEnv):
-        dev_percents = [policy.w_disk_percent, policy.w_cpu_percent]
-        dev_choices = [env.disk, env.cpu]
+        # Multi-NUMA and disk device configuration
+        dev_percents = []
+        dev_choices = []
+        
+        # Add disk device if configured
+        w_disk_percent = policy.get_device_percent('weight', 'disk')
+        if w_disk_percent > 0:
+            dev_percents.append(w_disk_percent)
+            dev_choices.append(env.disk)
+        
+        # Add all configured NUMA devices
+        available_numa_nodes = env.get_available_numa_nodes()
+        for numa_id in available_numa_nodes:
+            numa_percent = policy.get_device_percent('weight', f'numa{numa_id}')
+            if numa_percent > 0:
+                dev_percents.append(numa_percent)
+                dev_choices.append(env.get_numa_device(numa_id))
+        
+        # Default to NUMA0 if no configuration
+        if not dev_choices:
+            dev_percents = [100]
+            dev_choices = [env.get_numa_device(0)]
 
         sizes = [np.prod(spec[0]) for spec in weight_specs]
         sizes_cumsum = np.cumsum(sizes)

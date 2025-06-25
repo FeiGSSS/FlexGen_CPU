@@ -1,11 +1,12 @@
 import dataclasses
-from typing import Union, List, Optional, Any
+from typing import Union, List, Optional, Any, Dict
 import gc
 import argparse
 
 import numpy as np
 import torch
 
+import flexgen.torch_numa as torch_numa
 
 
 KB = 1 << 10
@@ -30,18 +31,48 @@ class Task:
     
 @dataclasses.dataclass(frozen=True)
 class ExecutionEnv:
-    """Hardware environment."""
-    cpu: Any = None
+    """NUMA-aware hardware environment."""
+    numa_devices: Dict[int, Any] = None  # NUMA nodes: {0: numa0_device, 1: numa1_device, ...}
     disk: Any = None
     mixed: Any = None
 
     @classmethod
-    def create(cls, offload_dir):
+    def create_env(cls, offload_dir: str, numa_nodes: List[int]):
+        """Create NUMA-aware execution environment"""
         # fix recursive import
         from flexgen.torch_backend import TorchDevice, TorchDisk, TorchMixedDevice
-        cpu = TorchDevice("cpu")
+        
+        total_numa_nodes = torch_numa.get_numa_nodes()
+        numa_nodes = [n for n in numa_nodes if n in range(total_numa_nodes)]
+        
+        # Create NUMA devices
+        numa_devices = {}
+        device_list = []
+        for node_id in numa_nodes:
+            device = TorchDevice(f"numa{node_id}")
+            numa_devices[node_id] = device
+            device_list.append(device)
+        
+        # Create disk device
         disk = TorchDisk(offload_dir)
-        return cls(cpu=cpu, disk=disk, mixed=TorchMixedDevice([cpu, disk]))
+        device_list.append(disk)
+        
+        # Create mixed device with all NUMA nodes + disk
+        mixed = TorchMixedDevice(device_list)
+        
+        return cls(numa_devices=numa_devices, disk=disk, mixed=mixed)
+    
+    
+    def get_numa_device(self, node_id: int):
+        """Get NUMA device by node ID"""
+        if self.numa_devices and node_id in self.numa_devices:
+            return self.numa_devices[node_id]
+        else:
+            raise ValueError(f"NUMA node {node_id} not available")
+    
+    def get_available_numa_nodes(self):
+        """Get list of available NUMA node IDs"""
+        return list(self.numa_devices.keys()) if self.numa_devices else []
     
     
 np_dtype_to_torch_dtype = {
@@ -71,12 +102,7 @@ torch_dtype_to_num_bytes = {
 class Policy:
     batch_size: int
     num_batches: int
-
-    # Legacy percent format for backward compatibility
-    w_cpu_percent: float
-    cache_cpu_percent: float
-    act_cpu_percent: float
-
+    
     # Whether to overlap the I/O and compute
     overlap: bool
 
@@ -94,42 +120,14 @@ class Policy:
     comp_cache: bool
     comp_cache_config: Any
     
-    # New NUMA-aware device configuration
+    # NUMA-aware device configuration
     device_config: Any = None  # Dict containing device placement configuration
 
-    @property
-    def w_disk_percent(self):
-        return 100  - self.w_cpu_percent
-
-    @property
-    def cache_disk_percent(self):
-        return 100 - self.cache_cpu_percent
-
-    @property
-    def act_disk_percent(self):
-        return 100 - self.act_cpu_percent
-    
     def get_device_percent(self, component: str, device: str) -> float:
         """Get percentage for a specific component and device"""
         if self.device_config and component in self.device_config:
             return self.device_config[component].get(device, 0)
-        else:
-            # Fallback to legacy percent format
-            if device == 'numa0':
-                if component == 'weight':
-                    return self.w_cpu_percent
-                elif component == 'cache':
-                    return self.cache_cpu_percent
-                elif component == 'activation':
-                    return self.act_cpu_percent
-            elif device == 'disk':
-                if component == 'weight':
-                    return self.w_disk_percent
-                elif component == 'cache':
-                    return self.cache_disk_percent
-                elif component == 'activation':
-                    return self.act_disk_percent
-            return 0
+        return 0
     
     @classmethod
     def create_from_device_config(cls, 
@@ -143,26 +141,18 @@ class Policy:
                                  comp_weight_config: Any,
                                  comp_cache: bool,
                                  comp_cache_config: Any):
-        """Create Policy from new device configuration format"""
-        # Extract legacy percentages for backward compatibility
-        w_cpu_percent = device_config.get('weight', {}).get('numa0', 0)
-        cache_cpu_percent = device_config.get('cache', {}).get('numa0', 0)
-        act_cpu_percent = device_config.get('activation', {}).get('numa0', 0)
-        
+        """Create Policy from NUMA device configuration"""
         return cls(
             batch_size=batch_size,
             num_batches=num_batches,
-            w_cpu_percent=w_cpu_percent,
-            cache_cpu_percent=cache_cpu_percent,
-            act_cpu_percent=act_cpu_percent,
+            device_config=device_config,
             overlap=overlap,
             sep_layer=sep_layer,
             attn_sparsity=attn_sparsity,
             comp_weight=comp_weight,
             comp_weight_config=comp_weight_config,
             comp_cache=comp_cache,
-            comp_cache_config=comp_cache_config,
-            device_config=device_config
+            comp_cache_config=comp_cache_config
         )
     
     

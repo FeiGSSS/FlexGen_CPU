@@ -15,16 +15,22 @@ from flexgen.torch_backend import (TorchDevice,
                                    TorchDisk,
                                    TorchMixedDevice,
                                    AsyncIOManager,
-                                   fix_recursive_import,
-                                   DeviceType, init_numa_support)
+                                   fix_recursive_import)
 
 from flexgen.opt_config import get_opt_config
 from flexgen.compression import CompressionConfig
 from flexgen.model.model import OptLM
 from flexgen.timer import timers
+import flexgen.torch_numa as torch_numa
 
 fix_recursive_import()
 
+NUM_NUMAS = torch_numa.get_numa_nodes()
+HF_MIRROR = 'https://hf-mirror.com'
+
+
+def setup_hf_mirror(mirror_url=HF_MIRROR):
+    os.environ['HF_ENDPOINT'] = mirror_url
 
 def parse_device_config(device_str):
     """
@@ -40,6 +46,10 @@ def parse_device_config(device_str):
             raise ValueError(f"Invalid device config format: {item}. Expected 'device:percentage'")
         device, percent_str = item.split(':', 1)
         device = device.strip()
+        
+        assert device in ['numa'+str(i) for i in range(NUM_NUMAS)] + ['disk'], \
+            f"Invalid device: {device}. Expected numa0, numa1, ..., disk"
+            
         try:
             percent = int(percent_str.strip())
         except ValueError:
@@ -58,61 +68,6 @@ def parse_device_config(device_str):
     return config
 
 
-def convert_legacy_percent_to_device_config(percent_args):
-    """
-    Convert legacy --percent arguments to new device config format
-    percent_args: [weight_cpu_percent, cache_cpu_percent, activation_cpu_percent]
-    """
-    if len(percent_args) != 3:
-        raise ValueError("Legacy percent format requires exactly 3 values")
-    
-    w_cpu, cache_cpu, act_cpu = percent_args
-    
-    device_config = {
-        'weight': {},
-        'cache': {},
-        'activation': {}
-    }
-    
-    # Weight distribution
-    if w_cpu > 0:
-        device_config['weight']['numa0'] = w_cpu
-    if w_cpu < 100:
-        device_config['weight']['disk'] = 100 - w_cpu
-    
-    # Cache distribution  
-    if cache_cpu > 0:
-        device_config['cache']['numa0'] = cache_cpu
-    if cache_cpu < 100:
-        device_config['cache']['disk'] = 100 - cache_cpu
-    
-    # Activation distribution
-    if act_cpu > 0:
-        device_config['activation']['numa0'] = act_cpu
-    if act_cpu < 100:
-        device_config['activation']['disk'] = 100 - act_cpu
-        
-    return device_config
-
-
-def get_filename(args):
-    model_size = args.model.split('-')[-1]
-    percent = ""
-    for i in range(len(args.percent)):
-        percent += str(args.percent[i]) + "-"
-    filename = f"fo-{model_size}-gbs{args.batch_size}-" \
-               f"ngbs{args.num_batches}-" \
-               f"prompt{args.prompt_len}-" \
-               f"gen{args.gen_len}-percent-{percent}"
-               
-    if args.compress_weight:
-        filename += "-compw"
-    if args.compress_cache:
-        filename += "-compc"
-        
-    return filename
-
-
 def get_test_inputs(prompt_len, num_prompts, tokenizer):
     prompts = ["Paris is the capital city of"]
     input_ids = tokenizer(prompts, padding="max_length",
@@ -120,44 +75,24 @@ def get_test_inputs(prompt_len, num_prompts, tokenizer):
     return (input_ids[0],) * num_prompts
 
 
+def get_filename(args):
+    """Generate filename for benchmark log"""
+    model_size = args.model.split('/')[-1]  # Extract model size from path like "facebook/opt-125m"
+    return f"fo-{model_size}-gbs{args.batch_size}-ngbs{args.num_batches}-prompt{args.prompt_len}-gen{args.gen_len}-percent-100-100-100-"
+
+
 def run_flexllmgen(args):
     print(f"<run_flexllmgen>: args.model: {args.model}")
     
-    # Initialize NUMA support
-    init_numa_support()
-    
     # Process device configuration
-    device_config = None
-    if any([args.device_config, args.weight_devices, args.cache_devices, args.activation_devices]):
-        # Use new NUMA-aware configuration
-        device_config = {
-            'weight': {},
-            'cache': {},
-            'activation': {}
-        }
+    device_config = {}
+    device_config['weight'] = parse_device_config(args.weight_devices)
+    device_config['cache'] = parse_device_config(args.cache_devices)
+    device_config['activation'] = parse_device_config(args.activation_devices)
         
-        if args.device_config:
-            # Parse comprehensive device config
-            parts = args.device_config.split()
-            for part in parts:
-                if ':' not in part:
-                    continue
-                comp_type, devices = part.split(':', 1)
-                device_config[comp_type] = parse_device_config(devices)
-        else:
-            # Parse individual device configs
-            if args.weight_devices:
-                device_config['weight'] = parse_device_config(args.weight_devices)
-            if args.cache_devices:
-                device_config['cache'] = parse_device_config(args.cache_devices)
-            if args.activation_devices:
-                device_config['activation'] = parse_device_config(args.activation_devices)
-    else:
-        # Use legacy percent configuration
-        device_config = convert_legacy_percent_to_device_config(args.percent)
-        
-    print(f"Device configuration: {device_config}")
+    print(f"Device configuration: \n {device_config}")
     
+    setup_hf_mirror(args.hf_mirror)
     if args.model == "facebook/galactica-30b":
         tokenizer = AutoTokenizer.from_pretrained("facebook/galactica-30b", padding_side="left")
     else:
@@ -169,25 +104,27 @@ def run_flexllmgen(args):
     warmup_inputs = get_test_inputs(32, num_prompts, tokenizer)
     inputs = get_test_inputs(prompt_len, num_prompts, tokenizer)
 
-    cpu = TorchDevice("cpu")
-    disk = TorchDisk(args.offload_dir)
-    env = ExecutionEnv(cpu=cpu, disk=disk, mixed=TorchMixedDevice([cpu, disk]))
+    # Create NUMA-aware execution environment
+    env = ExecutionEnv.create_env(args.offload_dir, numa_nodes=list(range(NUM_NUMAS)))
+    print(f"Available NUMA nodes: {env.get_available_numa_nodes()}")
 
     # Create policy using new device configuration
-    policy = Policy.create_from_device_config(
-        batch_size=args.batch_size,
-        num_batches=args.num_batches,
-        device_config=device_config,
-        overlap=args.overlap,
-        sep_layer=args.sep_layer,
-        attn_sparsity=args.attn_sparsity,
-        comp_weight=args.compress_weight,
-        comp_weight_config=CompressionConfig(num_bits=4, group_size=64,
-                                           group_dim=0, symmetric=False),
-        comp_cache=args.compress_cache,
-        comp_cache_config=CompressionConfig(num_bits=4, group_size=64,
-                                          group_dim=2, symmetric=False)
-    )
+    policy = Policy.create_from_device_config(batch_size=args.batch_size,
+                                              num_batches=args.num_batches,
+                                              device_config=device_config,
+                                              overlap=args.overlap,
+                                              sep_layer=args.sep_layer,
+                                              attn_sparsity=args.attn_sparsity,
+                                              comp_weight=args.compress_weight,
+                                              comp_weight_config=CompressionConfig(num_bits=4,
+                                                                                   group_size=64,
+                                                                                   group_dim=0,
+                                                                                   symmetric=False),
+                                              comp_cache=args.compress_cache,
+                                              comp_cache_config=CompressionConfig(num_bits=4,
+                                                                                  group_size=64,
+                                                                                  group_dim=2,
+                                                                                  symmetric=False))
     
     assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
 
@@ -225,7 +162,7 @@ def run_flexllmgen(args):
     num_generated_tokens = num_prompts * gen_len
     total_latency = prefill_latency + decode_latency
     total_throughput = num_generated_tokens / total_latency
-    _, cpu_peak_mem = cpu.mem_stats()
+    _, cpu_peak_mem = env.get_numa_device(env.get_available_numa_nodes()[0]).mem_stats()
 
     if DUMMY_WEIGHT not in args.path:
         outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
@@ -236,7 +173,7 @@ def run_flexllmgen(args):
         if args.verbose >= 2:
             print(show_str)
 
-    cpu.print_stats()
+    env.get_numa_device(env.get_available_numa_nodes()[0]).print_stats()
     projected = cut_gen_len
 
     if args.log_file == "auto":
@@ -256,6 +193,9 @@ def run_flexllmgen(args):
         print(log_str)
 
 
+
+
+
 def add_parser_arguments(parser):
     parser.add_argument("--model", type=str, default="facebook/opt-6.7b",
         help="The model name.")
@@ -264,28 +204,21 @@ def add_parser_arguments(parser):
              "FlexLLMGen will automatically download them from HuggingFace.")
     parser.add_argument("--offload_dir", type=str, default="~/flexllmgen_offload_dir",
         help="The directory to offload tensors. ")
+    parser.add_argument("--hf_mirror", type=str, default="https://hf-mirror.com",
+        help="HuggingFace mirror URL (default: https://hf-mirror.com)")
     parser.add_argument("--prompt_len", type=int, default=512)
     parser.add_argument("--gen_len", type=int, default=32)
     parser.add_argument("--cut_gen_len", type=int,
         help="Cut generation length for fast debugging.")
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--num_batches", type=int, default=1)
-    parser.add_argument("--percent", nargs="+", type=int,
-        default=[100, 100, 100],
-        help="Three numbers. They are "
-         "the percentage of weight on CPU, "
-         "the percentage of attention cache on CPU, "
-         "the percentage of activations on CPU")
     
-    # New NUMA-aware device configuration
-    parser.add_argument("--device-config", type=str, default=None,
-        help="NUMA-aware device configuration. Format: "
-             "'weight:numa0=50,numa1=30,disk=20 cache:numa0=70,numa1=30 activation:numa0=100'")
-    parser.add_argument("--weight-devices", type=str, default=None,
+    # NUMA-aware device configuration
+    parser.add_argument("--weight_devices", type=str, default=None,
         help="Weight placement. Format: 'numa0:50,numa1:30,disk:20'")
-    parser.add_argument("--cache-devices", type=str, default=None,
+    parser.add_argument("--cache_devices", type=str, default=None,
         help="Cache placement. Format: 'numa0:70,numa1:30'")
-    parser.add_argument("--activation-devices", type=str, default=None,
+    parser.add_argument("--activation_devices", type=str, default=None,
         help="Activation placement. Format: 'numa0:100'")
     
     parser.add_argument("--sep_layer", type=str2bool, nargs='?',

@@ -41,7 +41,7 @@ class InputEmbed(BaseModel):
         self.config = config
         self.env = env
         self.policy = policy
-        self.compute = env.cpu
+        self.compute = env.get_numa_device(0)
         self.weight_load_dst = self.compute.compressed_device if policy.comp_weight else self.compute
         
     def init_weight(self, weight_home: ValueHolder, path:str)-> None:
@@ -135,7 +135,7 @@ class OutputEmbed(BaseModel):
         self.config = config
         self.env = env
         self.policy = policy
-        self.compute = env.cpu
+        self.compute = env.get_numa_device(0)  # Simple: use NUMA0 for compute
         self.weight_load_dst = self.compute.compressed_device if policy.comp_weight else self.compute
         
     def init_weight(self, weight_home: ValueHolder, path:str)-> None:
@@ -223,7 +223,7 @@ class SelfAttention(BaseModel):
         self.env = env
         self.policy = policy
         self.layer_idx = layer_idx
-        self.compute = env.cpu
+        self.compute = env.get_numa_device(0)  # Simple: use NUMA0 for compute
         self.weight_load_dst = self.compute.compressed_device if policy.comp_weight else self.compute
         self.attention_compute = self.compute
         
@@ -278,11 +278,30 @@ class SelfAttention(BaseModel):
         
     def init_cache_one_batch(self, cache_home: ValueHolder):
         device: Union[TorchDevice, TorchDisk, TorchMixedDevice] = None
-        if self.policy.cache_cpu_percent == 100:
-            device = self.env.cpu
-        elif self.policy.cache_disk_percent == 100:
+        
+        # Smart device selection based on configuration
+        cache_disk_percent = self.policy.get_device_percent('cache', 'disk')
+        
+        # Check if all cache is on a single NUMA node
+        single_numa_device = None
+        total_numa_percent = 0
+        available_numa_nodes = self.env.get_available_numa_nodes()
+        
+        for numa_id in available_numa_nodes:
+            numa_percent = self.policy.get_device_percent('cache', f'numa{numa_id}')
+            total_numa_percent += numa_percent
+            if numa_percent >= 100:
+                single_numa_device = self.env.get_numa_device(numa_id)
+                break
+        
+        if single_numa_device is not None:
+            # All on single NUMA node
+            device = single_numa_device
+        elif cache_disk_percent >= 100:
+            # All on disk
             device = self.env.disk
         else:
+            # Mixed allocation
             device = self.env.mixed
             
         if self.policy.comp_cache:
@@ -591,7 +610,7 @@ class MLP(BaseModel):
         self.env = env
         self.policy = policy
         self.layer_idx = layer_idx
-        self.compute = env.cpu
+        self.compute = env.get_numa_device(0)  # Simple: use NUMA0 for compute
         self.weight_load_dst = (self.compute.compressed_device if policy.comp_weight
             else self.compute)
         
@@ -757,8 +776,6 @@ class OptLM:
                  env: ExecutionEnv,
                  path: str,
                  policy: Policy):
-        if isinstance(config, str):
-            config = get_opt_config(config)
         self.config = config
         self.env = env
         self.path = path
@@ -777,12 +794,26 @@ class OptLM:
         self.layers = layers
         self.num_layers = len(layers)
         
-        if self.policy.act_cpu_percent == 100:
-            self.act_home = self.env.cpu
-        elif self.policy.act_disk_percent == 100:
+        # Smart activation device selection
+        act_disk_percent = self.policy.get_device_percent('activation', 'disk')
+        
+        # Check if all activation is on a single NUMA node
+        single_numa_device = None
+        available_numa_nodes = self.env.get_available_numa_nodes()
+        
+        for numa_id in available_numa_nodes:
+            numa_percent = self.policy.get_device_percent('activation', f'numa{numa_id}')
+            if numa_percent >= 100:
+                single_numa_device = self.env.get_numa_device(numa_id)
+                break
+        
+        if single_numa_device is not None:
+            self.act_home = single_numa_device
+        elif act_disk_percent >= 100:
             self.act_home = self.env.disk
         else:
-            raise NotImplementedError()
+            # Default to first available NUMA node for complex cases
+            self.act_home = self.env.get_numa_device(available_numa_nodes[0])
         
         # IO streams
         self.load_weight_stream = CPUStreamExecutor()
@@ -1007,7 +1038,7 @@ class OptLM:
         right = left + batch_size
         input_ids = self.output_ids[left:right, :self.task.prompt_len]
 
-        attention_compute = self.env.cpu
+        attention_compute = self.act_home  # Use the same device as activation
         val = attention_compute.allocate((self.policy.batch_size, self.task.prompt_len), bool)
         val.load_from_np((input_ids != self.config.pad_token_id))
         self.attention_mask[batch_idx].store(val)
@@ -1066,7 +1097,9 @@ class OptLM:
             for k in range(num_batches):
                 self.init_cache(j, k)
         
-        self.env.cpu.init_attention_compute_workspace(self.config, self.task, self.policy)
+        # Use the primary compute device (usually NUMA0) for attention workspace
+        primary_compute_device = self.env.get_numa_device(self.env.get_available_numa_nodes()[0])
+        primary_compute_device.init_attention_compute_workspace(self.config, self.task, self.policy)
         
         if not overlap:
             # No overlap, easy to understand, suitable for debugging
@@ -1084,7 +1117,9 @@ class OptLM:
             for k in range(num_batches):
                 self.delete_cache(j, k)
                 
-        self.env.cpu.del_attention_compute_workspace()
+        # Use the same primary compute device for cleanup
+        primary_compute_device = self.env.get_numa_device(self.env.get_available_numa_nodes()[0])
+        primary_compute_device.del_attention_compute_workspace()
 
         return self.output_ids
     

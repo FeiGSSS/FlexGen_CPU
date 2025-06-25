@@ -16,10 +16,10 @@ from flexgen.opt_config import OptConfig
 @dataclasses.dataclass
 class CompressionConfig:
     """Group-wise quantization."""
-    num_bits: int
-    group_size: int
-    group_dim: int
-    symmetric: bool
+    num_bits: int = 4
+    group_size: int = 64
+    group_dim: int = 0
+    symmetric: bool = False
     enabled: bool = True
 
 
