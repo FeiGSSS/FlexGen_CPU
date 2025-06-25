@@ -8,7 +8,21 @@ from typing import List, Union, Optional
 
 # 导入我们的 C++ 扩展
 try:
-    # 直接导入 C++ 扩展模块
+    # 尝试多种导入方式
+    import sys
+    import os
+    
+    # 添加当前目录到路径
+    current_dir = os.path.dirname(__file__)
+    if current_dir not in sys.path:
+        sys.path.insert(0, current_dir)
+    
+    # 添加父目录到路径
+    parent_dir = os.path.dirname(current_dir)
+    if parent_dir not in sys.path:
+        sys.path.insert(0, parent_dir)
+    
+    # 尝试导入
     import torch_numa_cpp as _torch_numa_cpp
     
     # 重新导出主要函数
