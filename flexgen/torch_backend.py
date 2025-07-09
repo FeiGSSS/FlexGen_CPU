@@ -190,8 +190,6 @@ class TorchTensor():
                 np_array = np.ascontiguousarray(np_array)
 
             try:
-                # --- 使用优化的并行内存拷贝 ---
-                # 基于基准测试结果，CPU→NUMA传输可获得5.3x性能提升
                 _optimized_copy.optimized_memmove(
                     dst_ptr=int(ptr),
                     src_ptr=int(np_array.ctypes.data),
@@ -646,8 +644,6 @@ class AsyncIOManager:
         if not dst_data.is_contiguous():
             dst_data = dst_data.contiguous()
             
-        # 使用优化的并行内存拷贝
-        # 基于基准测试：NUMA→CPU可获得6.9x性能提升
         _optimized_copy.optimized_memmove(
             dst_ptr=int(dst_data.data_ptr()),
             src_ptr=int(src_ptr),
@@ -678,8 +674,6 @@ class AsyncIOManager:
         if not src_data.is_contiguous():
             src_data = src_data.contiguous()
         try:
-            # 使用优化的并行内存拷贝  
-            # 基于基准测试：CPU→NUMA可获得5.3x性能提升
             _optimized_copy.optimized_memmove(
                 dst_ptr=int(dst_ptr),
                 src_ptr=int(src_data.data_ptr()),

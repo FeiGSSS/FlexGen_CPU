@@ -188,7 +188,7 @@ class OutputEmbed(BaseModel):
         else:
             ids = last_token_logits.argmax(dim=1, keepdim=True)
         
-        hidden.val =  TorchTensor.create_from_torch(ids, self.compute)
+        hidden.val = TorchTensor.create_from_torch(ids, self.compute)
         
         
 class SelfAttention(BaseModel):
