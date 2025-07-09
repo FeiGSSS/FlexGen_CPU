@@ -29,7 +29,7 @@ class OptConfig:
     layer_norm_eps: float = 0.00001
     pad_token_id: int = 1
     # dtype: type = np.float16
-    dtype: type = np.float32  # Use float32 for better compatibility with FlexGen
+    dtype: type = np.float32
 
     def model_bytes(self):
         # 估算整个 OPT 模型参数的总字节数（即模型大小，单位是字节）

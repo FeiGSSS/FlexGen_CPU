@@ -13,16 +13,14 @@ from flexgen.utils import (
 )
 from flexgen.torch_backend import (TorchDevice,
                                    TorchDisk,
-                                   TorchMixedDevice,
-                                   AsyncIOManager,
-                                   fix_recursive_import)
+                                   TorchNuma,
+                                   AsyncIOManager)
 
 from flexgen.opt_config import get_opt_config
-from flexgen.compression import CompressionConfig
 from flexgen.model.model import OptLM
 from flexgen.timer import timers
 
-fix_recursive_import()
+from flexgen.torch_backend import  print_memory_copy_stats
 
 
 def get_filename(args):
@@ -34,11 +32,6 @@ def get_filename(args):
                f"ngbs{args.num_batches}-" \
                f"prompt{args.prompt_len}-" \
                f"gen{args.gen_len}-percent-{percent}"
-               
-    if args.compress_weight:
-        filename += "-compw"
-    if args.compress_cache:
-        filename += "-compc"
         
     return filename
 
@@ -64,25 +57,21 @@ def run_flexllmgen(args):
     inputs = get_test_inputs(prompt_len, num_prompts, tokenizer)
 
     cpu = TorchDevice("cpu")
+    numa = TorchNuma(numa_node=2)
     disk = TorchDisk(args.offload_dir)
-    env = ExecutionEnv(cpu=cpu, disk=disk, mixed=TorchMixedDevice([cpu, disk]))
+    env = ExecutionEnv(cpu=cpu, disk=disk, numa=numa)
 
     policy = Policy(args.batch_size,
                     args.num_batches,
                     args.percent[0],
                     args.percent[1],
                     args.percent[2],
+                    args.percent[3],
+                    args.percent[4],
+                    args.percent[5],
                     args.overlap,
                     args.sep_layer,
-                    args.attn_sparsity,
-                    args.compress_weight,
-                    CompressionConfig(num_bits=4, group_size=64,
-                                      group_dim=0, symmetric=False),
-                    args.compress_cache,
-                    CompressionConfig(num_bits=4, group_size=64,
-                                      group_dim=2, symmetric=False))
-    
-    assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
+                    args.attn_sparsity)
 
     opt_config = get_opt_config(args.model)
     cache_size = opt_config.cache_bytes(num_prompts, prompt_len + gen_len)
@@ -97,12 +86,12 @@ def run_flexllmgen(args):
     try:
         print("warmup - generate")
         output_ids = model.generate(
-            warmup_inputs, max_new_tokens=1, verbose=args.verbose)
+            warmup_inputs, max_new_tokens=1)
 
         print("benchmark - generate")
         timers("generate").reset()
         output_ids = model.generate(
-            inputs, max_new_tokens=args.gen_len, cut_gen_len=cut_gen_len, verbose=args.verbose)
+            inputs, max_new_tokens=args.gen_len, cut_gen_len=cut_gen_len)
         costs = timers("generate").costs
     finally:
         AsyncIOManager().close()
@@ -164,11 +153,10 @@ def add_parser_arguments(parser):
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--num_batches", type=int, default=1)
     parser.add_argument("--percent", nargs="+", type=int,
-        default=[100, 100, 100],
-        help="Three numbers. They are "
-         "the percentage of weight on CPU, "
-         "the percentage of attention cache on CPU, "
-         "the percentage of activations on CPU")
+        default=[100, 100, 100, 0, 0, 0],
+        help="Six integers representing the percentage of "
+             "weight_cpu, cache_cpu, act_cpu, "
+             "weight_numa, cache_numa, act_numa.")
     parser.add_argument("--sep_layer", type=str2bool, nargs='?',
         const=True, default=True)
     parser.add_argument("--attn_sparsity", type=float, default=1.0)
@@ -188,6 +176,14 @@ def add_parser_arguments(parser):
 
 
 if __name__ == "__main__":
+    # 获取当前的 PID 并停顿 10s
+    import time
+    import os
+    pid = os.getpid()
+    print(f"Running FlexLLMGen with PID: {pid}")
+    time.sleep(10)
+    
+    
     # 过滤已知的warning
     warnings.filterwarnings("ignore", category=FutureWarning, module="torch")
     warnings.filterwarnings("ignore", message="TypedStorage is deprecated")
@@ -199,3 +195,5 @@ if __name__ == "__main__":
     assert not args.compress_weight, "compress_weight is Not support Now"
 
     run_flexllmgen(args)
+    
+    print_memory_copy_stats()

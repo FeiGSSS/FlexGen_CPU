@@ -33,17 +33,9 @@ class ExecutionEnv:
     """Hardware environment."""
     cpu: Any = None
     disk: Any = None
-    mixed: Any = None
+    numa: Any = None
 
-    @classmethod
-    def create(cls, offload_dir):
-        # fix recursive import
-        from flexgen.torch_backend import TorchDevice, TorchDisk, TorchMixedDevice
-        cpu = TorchDevice("cpu")
-        disk = TorchDisk(offload_dir)
-        return cls(cpu=cpu, disk=disk, mixed=TorchMixedDevice([cpu, disk]))
-    
-    
+
 np_dtype_to_torch_dtype = {
     np.float16: torch.float16,
     np.float32: torch.float32,
@@ -76,6 +68,10 @@ class Policy:
     w_cpu_percent: float
     cache_cpu_percent: float
     act_cpu_percent: float
+    
+    w_numa_percent: float
+    cache_numa_percent: float
+    act_numa_percent: float
 
     # Whether to overlap the I/O and compute
     overlap: bool
@@ -85,26 +81,18 @@ class Policy:
 
     # Sparsity of attention weights
     attn_sparsity: float
-    
-    # Compress weights with group-wise quantization
-    comp_weight: bool
-    comp_weight_config: Any
-
-    # Compress KV cache with group-wise quantization
-    comp_cache: bool
-    comp_cache_config: Any
 
     @property
     def w_disk_percent(self):
-        return 100  - self.w_cpu_percent
+        return 100  - self.w_cpu_percent - self.w_numa_percent
 
     @property
     def cache_disk_percent(self):
-        return 100 - self.cache_cpu_percent
+        return 100 - self.cache_cpu_percent - self.cache_numa_percent
 
     @property
     def act_disk_percent(self):
-        return 100 - self.act_cpu_percent
+        return 100 - self.act_cpu_percent - self.act_numa_percent
     
     
 def cpu_mem_stats() -> int:
