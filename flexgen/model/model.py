@@ -187,10 +187,14 @@ class OutputEmbed(BaseModel):
             ids = torch.multinomial(probs, num_samples=1)
         else:
             ids = last_token_logits.argmax(dim=1, keepdim=True)
-        
-        hidden.val = TorchTensor.create_from_torch(ids, self.compute)
-        
-        
+
+        if self.task.logits:
+            hidden.val = [TorchTensor.create_from_torch(logits, self.compute),
+                            TorchTensor.create_from_torch(ids, self.compute)]
+        else:
+            hidden.val = TorchTensor.create_from_torch(ids, self.compute)
+
+
 class SelfAttention(BaseModel):
     def __init__(
         self,
@@ -909,8 +913,21 @@ class OptLM:
         if layer_idx == self.num_layers - 1:  # store to output
             batch_size = self.policy.batch_size
             left, right = batch_idx * batch_size, (batch_idx + 1) * batch_size
-            ids = self.hidden[token_idx][layer_idx][batch_idx].pop().data.detach().numpy()
+            # ids = self.hidden[token_idx][layer_idx][batch_idx].pop().data.detach().numpy()
+            
+            if self.task.logits:
+                logits, ids = self.hidden[token_idx][layer_idx][batch_idx].pop()
+                logits = logits.data.detach().numpy()
+                ids = ids.data.detach().numpy()
+            else:
+                ids = self.hidden[token_idx][layer_idx][batch_idx].pop().data.detach().numpy()
+                logits = None
+            
             pos = self.task.prompt_len + token_idx
+            
+            if logits is not None:
+                self.logits[left:right] = logits
+            
             if self.task.stop:
                 stopped = self.stopped[left:right]
                 self.output_ids[left:right, pos:pos+1] = np.where(
@@ -1032,6 +1049,84 @@ class OptLM:
         self.env.cpu.del_attention_compute_workspace()
 
         return self.output_ids
+    
+    def get_logits(self, inputs: Union[np.array, List[List[int]]]):
+        
+        max_new_tokens = 0
+        do_sample = False
+        temperature = 1.0
+        stop = None
+        cut_gen_len = 0
+        
+        task = Task(
+            inputs=inputs,
+            prompt_len=len(inputs[0]),
+            gen_len=max_new_tokens,
+            cut_gen_len=cut_gen_len,
+            do_sample=do_sample,
+            temperature=temperature,
+            stop=stop,
+            logits=True
+        )
+        
+        num_layers = self.num_layers
+        num_batches = self.num_batches
+        batch_size = self.policy.batch_size
+        overlap = self.policy.overlap
+        prompt_len, gen_len = task.prompt_len, task.gen_len
+        self.execute_gen_len = task.cut_gen_len if task.cut_gen_len else task.gen_len
+        
+        # Output token ids
+        self.output_ids = np.full((len(task.inputs), prompt_len + gen_len),
+                                  self.config.pad_token_id,
+                                  dtype=np.int32)
+        self.stopped = np.zeros((len(task.inputs), 1), dtype=bool)
+        self.output_ids[:, :prompt_len] = np.asarray(task.inputs)
+        self.logits = np.zeros((len(task.inputs), prompt_len + gen_len, self.config.vocab_size), dtype=np.float32)
+        
+        assert batch_size * num_batches == len(task.inputs)
+        
+        for j in range(num_layers):
+            for k in range(num_batches):
+                self.cache_home[j][k].clear()
+                self.cache_read_buf[j][k].clear()
+                self.cache_write_buf[j][k].clear()
+                
+        for j in range(num_layers):
+            self.weight_read_buf[j].clear()
+            
+        for k in range(num_batches):
+            self.attention_mask[k].clear()
+            
+        self.hidden = array_3d(gen_len, num_layers, num_batches, ValueHolder)
+        
+        self.set_task(task)
+        
+        for j in range(num_layers):
+            for k in range(num_batches):
+                self.init_cache(j, k)
+        
+        self.env.cpu.init_attention_compute_workspace(self.config, self.task, self.policy)
+        
+        if not overlap:
+            # No overlap, easy to understand, suitable for debugging
+            self.generation_loop_normal()
+        else:
+            # Overlap I/O and compute
+            if num_batches == 1:
+                self.generation_loop_overlap_single_batch()
+            else:
+                raise NotImplementedError("Only support num_batches=1 for now")
+                # self.generation_loop_overlap_multi_batch()
+        
+        # Delete cache
+        for j in range(num_layers):
+            for k in range(num_batches):
+                self.delete_cache(j, k)
+                
+        self.env.cpu.del_attention_compute_workspace()
+
+        return self.output_ids, self.logits
     
     def generation_loop_normal(self):
         for i in range(self.execute_gen_len):
