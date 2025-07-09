@@ -175,15 +175,7 @@ def add_parser_arguments(parser):
     
 
 
-if __name__ == "__main__":
-    # 获取当前的 PID 并停顿 10s
-    import time
-    import os
-    pid = os.getpid()
-    print(f"Running FlexLLMGen with PID: {pid}")
-    time.sleep(10)
-    
-    
+if __name__ == "__main__":    
     # 过滤已知的warning
     warnings.filterwarnings("ignore", category=FutureWarning, module="torch")
     warnings.filterwarnings("ignore", message="TypedStorage is deprecated")
