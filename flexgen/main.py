@@ -150,7 +150,12 @@ def add_parser_arguments(parser):
     parser.add_argument("--gen_len", type=int, default=32)
     parser.add_argument("--cut_gen_len", type=int,
         help="Cut generation length for fast debugging.")
-    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=4,
+        help="batch size",
+    )
     parser.add_argument("--num_batches", type=int, default=1)
     parser.add_argument("--percent", nargs="+", type=int,
         default=[100, 100, 100, 0, 0, 0],

@@ -498,6 +498,8 @@ class Evaluate(Simple_Evaluate):
                 higher_is_better[key]['total_latency'] = False
                 higher_is_better[key]['total_throughput'] = True
                 if bool(group_agg) & show_group_table:
+                    if key not in group_agg.keys():
+                        group_agg[key] = {}
                     group_agg[key]['prefill_latency/TTFT_mean'] = self.latancy_throughputs[key]['prefill_latency']['mean']
                     group_agg[key]['prefill_latency/TTFT_median'] = self.latancy_throughputs[key]['prefill_latency']['median']
                     group_agg[key]['prefill_latency/TTFT_p99'] = self.latancy_throughputs[key]['prefill_latency']['p99']
@@ -514,6 +516,8 @@ class Evaluate(Simple_Evaluate):
                     group_agg[key]['total_latency_p99'] = self.latancy_throughputs[key]['total_latency']['p99']
                     group_agg[key]['total_throughput'] = self.latancy_throughputs[key]['total_throughput']['mean']
                 else:
+                    if key not in results_agg.keys():
+                        results_agg[key] = {}
                     results_agg[key]['prefill_latency/TTFT_mean'] = self.latancy_throughputs[key]['prefill_latency']['mean']
                     results_agg[key]['prefill_latency/TTFT_median'] = self.latancy_throughputs[key]['prefill_latency']['median']
                     results_agg[key]['prefill_latency/TTFT_p99'] = self.latancy_throughputs[key]['prefill_latency']['p99']

@@ -623,7 +623,7 @@ class flexgen(TemplateLM):
             )
             # Store results with their request indices
             all_nlls.extend(zip(batch_indices, batch_nlls))
-            latency_throughput_list.append(latency_throughput)
+            latency_throughput_list.extend(latency_throughput)
 
         # Remove padding if necessary
         if (self.world_size > 1) and (pad_amnt > 0):

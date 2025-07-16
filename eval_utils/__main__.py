@@ -292,7 +292,7 @@ def get_model(
             eval_logger.warning("model_args not specified. Using defaults.")
             model_args = ""
         else:
-            assert args.device in ["cpu", "cuda"], "device should be assigned in  ['cpu', 'cuda']"
+            assert args.device in [None, "cpu", "cuda"], f"device is {args.device},  should be assigned in  [None, 'cpu', 'cuda']"
             eval_logger.info(
                 f"Initializing {args.model_type} model, with arguments: {simple_parse_args_string(model_args)}"
             )

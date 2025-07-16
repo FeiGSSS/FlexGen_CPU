@@ -994,6 +994,10 @@ class OptLM:
             temperature=temperature,
             stop=stop,
         )
+        tmp_batch_size = None
+        if self.policy.batch_size * self.num_batches != len(task.inputs):
+            tmp_batch_size = self.policy.batch_size
+            self.policy.batch_size = len(task.inputs)
         
         num_layers = self.num_layers
         num_batches = self.num_batches
@@ -1049,6 +1053,8 @@ class OptLM:
                 self.delete_cache(j, k)
                 
         self.env.cpu.del_attention_compute_workspace()
+        if tmp_batch_size is not None:
+            self.policy.batch_size = tmp_batch_size
 
         return self.output_ids
     
@@ -1071,6 +1077,10 @@ class OptLM:
             logits=True
         )
         
+        tmp_batch_size = None
+        if self.policy.batch_size * self.num_batches != len(task.inputs):
+            tmp_batch_size = self.policy.batch_size
+            self.policy.batch_size = len(task.inputs)
         num_layers = self.num_layers
         num_batches = self.num_batches
         batch_size = self.policy.batch_size
@@ -1131,6 +1141,8 @@ class OptLM:
                 self.delete_cache(j, k)
                 
         self.env.cpu.del_attention_compute_workspace()
+        if tmp_batch_size is not None:
+            self.policy.batch_size = tmp_batch_size
 
         return self.output_ids, self.logits
     

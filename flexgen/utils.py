@@ -61,7 +61,7 @@ torch_dtype_to_num_bytes = {
 }
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass()
 class Policy:
     batch_size: int
     num_batches: int
