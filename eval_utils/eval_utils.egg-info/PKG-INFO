@@ -1,0 +1,33 @@
+Metadata-Version: 2.4
+Name: eval_utils
+Version: 0.0.1
+Summary: A simplified LM Evaluation Harness.
+Home-page: https://github.com/your-repo/flexgen
+Author: Your Name
+Author-email: your.email@example.com
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Classifier: Topic :: Scientific/Engineering :: Artificial Intelligence
+Classifier: Topic :: Software Development :: Libraries :: Python Modules
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+Requires-Dist: torch>=1.12.0
+Requires-Dist: transformers>=4.24.0
+Requires-Dist: numpy
+Requires-Dist: tqdm>=4.0.0
+Requires-Dist: pulp
+Requires-Dist: attrs
+Requires-Dist: accelerate>=0.20.0
+Requires-Dist: packaging>=20.0
+Dynamic: author
+Dynamic: author-email
+Dynamic: classifier
+Dynamic: description
+Dynamic: description-content-type
+Dynamic: home-page
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
+
+LM Evaluation Harness Simplyfied.

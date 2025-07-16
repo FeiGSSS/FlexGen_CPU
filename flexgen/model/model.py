@@ -982,7 +982,9 @@ class OptLM:
                  do_sample: bool = False,
                  temperature: float = 1.0,
                  stop: Optional[int] = None,
-                 cut_gen_len: Optional[int] = None):
+                 cut_gen_len: Optional[int] = None, 
+                 **kwargs, 
+                 ):
         task = Task(
             inputs=inputs,
             prompt_len=len(inputs[0]),
@@ -1052,11 +1054,11 @@ class OptLM:
     
     def get_logits(self, inputs: Union[np.array, List[List[int]]]):
         
-        max_new_tokens = 0
+        max_new_tokens = 1
         do_sample = False
         temperature = 1.0
         stop = None
-        cut_gen_len = 0
+        cut_gen_len = 1
         
         task = Task(
             inputs=inputs,
@@ -1082,9 +1084,13 @@ class OptLM:
                                   dtype=np.int32)
         self.stopped = np.zeros((len(task.inputs), 1), dtype=bool)
         self.output_ids[:, :prompt_len] = np.asarray(task.inputs)
-        self.logits = np.zeros((len(task.inputs), prompt_len + gen_len, self.config.vocab_size), dtype=np.float32)
+        self.logits = np.zeros((len(task.inputs), prompt_len, self.config.vocab_size), dtype=np.float32)
+        # print(f"self.logits shape: {self.logits.shape}, {prompt_len}, {gen_len} \n =========***********");exit()
         
-        assert batch_size * num_batches == len(task.inputs)
+        # if len(task.inputs) != batch_size:
+        #     batch_size = len(task.inputs)
+            # self.policy.batch_size = batch_size
+        assert batch_size * num_batches == len(task.inputs), f"batch_size * num_batches != len(task.inputs)! batch_size:{batch_size}, num_batches:{num_batches}, len(task.inputs):{len(task.inputs)}"
         
         for j in range(num_layers):
             for k in range(num_batches):
